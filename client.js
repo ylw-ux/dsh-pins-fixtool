@@ -37,6 +37,8 @@ window.__ModuleLoader__.load({
     const QUOTE_CONTEXT = 24;
     const TOOLBAR_HEIGHT = 40;
     const TOOLBAR_WIDTH = 220;
+    /** How far from the recorded offset a re-located passage may sit, in characters. */
+    const LOCATE_WINDOW = 4000;
 
     const NODE_SELECTOR = '[data-chat-flow-key], [data-chat-node-key]';
 
@@ -99,9 +101,11 @@ window.__ModuleLoader__.load({
     /**
      * Heading for one Session in the overview.
      *
-     * The Conversation's own title lives in a projection this plugin does not
-     * read, so a Session is labelled by the first line of its newest pin — the
-     * text the user chose most recently, which is what they will recognise.
+     * The Session's real title is the preferred source and is read live (see
+     * `readSessionTitle`), so renaming a Session updates this heading. When no
+     * title exists yet — a brand-new Session has none until its first message — the
+     * newest pin's first line stands in, because that is the text the user chose
+     * and will recognise.
      */
     function sessionLabel(entry) {
       if (typeof entry?.title === 'string' && entry.title.trim() !== '') return entry.title.trim();
@@ -113,6 +117,85 @@ window.__ModuleLoader__.load({
       const text = (newest?.text ?? '').replace(/\s+/g, ' ').trim();
       if (text === '') return `${pins.length} 条固定片段`;
       return text.length > 18 ? `${text.slice(0, 18)}…` : text;
+    }
+
+    /**
+     * Read one Session's title through the Client session service.
+     *
+     * Three levels are probed, most direct first, because these method names may
+     * move between Harness releases: the projection value, the session list row,
+     * then the Session instance's own snapshot. Absence is not an error: a Session
+     * with no title yet simply reports an empty string, and callers fall back to
+     * the newest pin's text.
+     *
+     * @returns the title, or an empty string when none is available.
+     */
+    function readSessionTitle(context, sessionId) {
+      if (!sessionId) return '';
+      let sessions = null;
+      try {
+        sessions = context?.get?.('sessions') ?? null;
+      } catch {
+        return '';
+      }
+      if (!sessions) return '';
+
+      const clean = (value) => (typeof value === 'string' ? value.trim() : '');
+      try {
+        const projection = sessions.projectionValues?.(sessionId);
+        const fromProjection = clean(projection?.title);
+        if (fromProjection !== '') return fromProjection;
+      } catch {
+        /* fall through to the next level */
+      }
+      try {
+        const row = sessions.list?.getSnapshot?.()?.byId?.[sessionId];
+        const fromRow = clean(row?.title);
+        if (fromRow !== '') return fromRow;
+      } catch {
+        /* fall through to the next level */
+      }
+      try {
+        const fromBinding = clean(sessions.binding?.(sessionId)?.session?.getSnapshot?.()?.title);
+        if (fromBinding !== '') return fromBinding;
+      } catch {
+        /* no title available */
+      }
+      return '';
+    }
+
+    /**
+     * Subscribe to one Session's title changes, so a rename lands in the overview.
+     *
+     * The projection face is preferred: it is fed by the Host's broadcast frames
+     * without instantiating the Session. The Session instance is the fallback and
+     * is heavier, so it is only used when the face is unavailable.
+     *
+     * @returns an unsubscribe function, never `null`.
+     */
+    function subscribeSessionTitle(context, sessionId, onChange) {
+      const noop = () => {};
+      if (!sessionId) return noop;
+      let sessions = null;
+      try {
+        sessions = context?.get?.('sessions') ?? null;
+      } catch {
+        return noop;
+      }
+      if (!sessions) return noop;
+      try {
+        const session = sessions.binding?.(sessionId)?.session;
+        const face = session?.projections?.faceOf?.('title');
+        if (face && typeof face.subscribe === 'function') {
+          return face.subscribe(() => onChange());
+        }
+        if (session && typeof session.subscribe === 'function') {
+          return session.subscribe(() => onChange());
+        }
+      } catch {
+        /* no subscription surface; the title simply will not follow a rename */
+      }
+      return noop;
     }
 
     function normalizeTag(value) {
@@ -129,12 +212,17 @@ window.__ModuleLoader__.load({
       return false;
     }
 
-    /** Rough line count a card needs, so 1-line pins really render as one line. */
+    /**
+     * Rough line count a card needs, so a 1-line pin really renders as one line.
+     *
+     * Explicit line breaks count as lines too: a 40-character code snippet with
+     * four breaks is not a one-line card just because it is short.
+     */
     function cardLines(text) {
-      const length = (text ?? '').length;
-      if (length <= 30) return '1';
-      if (length <= 76) return '2';
-      return '3';
+      const value = String(text ?? '');
+      const breaks = value.slice(0, 600).split('\n').length;
+      const wrapped = value.length <= 30 ? 1 : value.length <= 76 ? 2 : 3;
+      return String(Math.max(breaks, wrapped, 1));
     }
 
     function newId() {
@@ -238,6 +326,37 @@ window.__ModuleLoader__.load({
           }
           return [...seen].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
         },
+        /**
+         * Delete a tag from every pin, across every Session.
+         *
+         * The overview has one tag list over all Sessions, and the per-Session view
+         * manages only its own: a delete must never reach into conversations the user
+         * is not looking at.
+         *
+         * @param sessionId - the Session to clear, or `undefined` for all of them.
+         * @returns how many pins the tag was removed from.
+         */
+        removeTagEverywhere(sessionId, tag) {
+          if (sessionId === undefined || sessionId === null) {
+            let touched = 0;
+            for (const id of Object.keys(data.sessions)) touched += api.removeTagEverywhere(id, tag);
+            return touched;
+          }
+          const entry = sessionOf(sessionId, false);
+          if (!entry) return 0;
+          let touched = 0;
+          for (const pin of entry.pins) {
+            const current = pin.tags ?? [];
+            if (!current.includes(tag)) continue;
+            pin.tags = current.filter((each) => each !== tag);
+            touched += 1;
+          }
+          if (touched > 0) {
+            entry.updatedAt = Date.now();
+            commit();
+          }
+          return touched;
+        },
         get(sessionId, id) {
           return sessionOf(sessionId, false)?.pins.find((pin) => pin.id === id);
         },
@@ -245,22 +364,29 @@ window.__ModuleLoader__.load({
         find(sessionId, anchor) {
           return sessionOf(sessionId, false)?.pins.find((pin) => sameAnchor(pin.anchor, anchor));
         },
-        /** Tags across every Session that holds pins, for the overview filter. */
-        allTags() {
-          const seen = new Set();
-          for (const [, entry] of api.sessions()) {
-            for (const pin of entry.pins ?? []) {
-              for (const tag of pin.tags ?? []) seen.add(tag);
-            }
-          }
-          return [...seen].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
-        },
         add(sessionId, pin, title) {
           const entry = sessionOf(sessionId, true);
           // One message holds many pins; only the same passage is a duplicate.
           const existing = entry.pins.find((each) => sameAnchor(each.anchor, pin.anchor));
-          if (existing) return existing;
-          const record = { ...pin, id: newId(), pinnedAt: Date.now() };
+          if (existing) {
+            // A pin created before the display form existed has no raw text; pinning
+            // the same passage again upgrades it in place instead of doing nothing.
+            if (typeof existing.anchor?.rawQuote !== 'string' && typeof pin.anchor?.rawQuote === 'string') {
+              existing.anchor = { ...existing.anchor, ...pin.anchor };
+              if (typeof pin.text === 'string' && pin.text !== '') existing.text = pin.text;
+              entry.updatedAt = Date.now();
+              commit();
+            }
+            return existing;
+          }
+          const record = {
+            ...pin,
+            // Display text keeps the selection's line breaks; the anchor keeps the
+            // normalized form the locator and the search work in.
+            text: typeof pin.text === 'string' && pin.text !== '' ? pin.text : (pin.anchor?.quote ?? ''),
+            id: newId(),
+            pinnedAt: Date.now(),
+          };
           entry.pins = [...entry.pins, record];
           touch(sessionId, title);
           commit();
@@ -275,23 +401,38 @@ window.__ModuleLoader__.load({
           if (entry.pins.length === 0) delete data.sessions[String(sessionId)];
           commit();
         },
-        setTags(sessionId, id, tags) {
+        /**
+         * Add a tag to one pin.
+         *
+         * Adding is deliberately not a toggle: an input that removes a label when you
+         * type the same word again is impossible to predict, so removal lives on the
+         * chips and the trash buttons alone. A repeat add reports `false` and the
+         * caller tells the user the tag is already there.
+         *
+         * @returns whether the pin gained the tag.
+         */
+        addTag(sessionId, id, tag) {
           const pin = api.get(sessionId, id);
-          if (!pin) return;
-          pin.tags = tags;
-          const entry = sessionOf(sessionId, true);
-          entry.updatedAt = Date.now();
-          commit();
-        },
-        /** Add a tag, or remove it when the passage already carries it. */
-        toggleTag(sessionId, id, tag) {
-          const pin = api.get(sessionId, id);
-          if (!pin) return;
+          if (!pin) return false;
           const current = pin.tags ?? [];
-          pin.tags = current.includes(tag) ? current.filter((each) => each !== tag) : [...current, tag];
+          if (current.includes(tag)) return false;
+          pin.tags = [...current, tag];
           const entry = sessionOf(sessionId, true);
           entry.updatedAt = Date.now();
           commit();
+          return true;
+        },
+        /** Remove one tag from one pin. @returns whether anything changed. */
+        removeTag(sessionId, id, tag) {
+          const pin = api.get(sessionId, id);
+          if (!pin) return false;
+          const current = pin.tags ?? [];
+          if (!current.includes(tag)) return false;
+          pin.tags = current.filter((each) => each !== tag);
+          const entry = sessionOf(sessionId, true);
+          entry.updatedAt = Date.now();
+          commit();
+          return true;
         },
       };
 
@@ -317,10 +458,28 @@ window.__ModuleLoader__.load({
       },
     };
 
-    /** Whitespace-normalized text of one DOM interval, matching `String.replace(/\s+/g, ' ')`. */
-    function intervalText(range) {
+    /** Which kind of markdown block a selection landed in, as the DOM reveals it at pin time. */
+    function blockKindOf(element) {
       try {
-        return String(range.toString()).replace(/\s+/g, ' ');
+        if (element.closest('pre, [data-code-block], .md-code-block')) return 'code';
+        if (element.closest('table')) return 'table';
+        if (element.closest('blockquote')) return 'quote';
+        if (element.closest('li')) return 'list';
+      } catch {
+        /* an element detached mid-read falls back to prose */
+      }
+      return 'prose';
+    }
+
+    /** The language label a fenced code block advertises, when the DOM carries one. */
+    function codeLanguageOf(element) {
+      try {
+        const banner = element.closest('[data-code-block], .md-code-block')?.querySelector('[data-code-block-banner], [data-lang], code[class*="language-"]');
+        const raw =
+          banner?.getAttribute?.('data-lang') ??
+          /language-([\w+#-]+)/.exec(banner?.className ?? '')?.[1] ??
+          '';
+        return String(raw).trim().slice(0, 16);
       } catch {
         return '';
       }
@@ -329,13 +488,31 @@ window.__ModuleLoader__.load({
     /**
      * Read a browser selection as a durable pin anchor.
      *
+     * Three things are captured, and each has one job:
+     *
+     * - `raw` keeps the selection exactly as the DOM serialized it, line breaks
+     *   and indentation included. It is the display text, the copy source, and the
+     *   first choice when re-locating the passage.
+     * - `quote` is the whitespace-normalized form. It is the only basis for search,
+     *   tag matching, and de-duplication of the same passage.
+     * - `block`, `lang`, and `partial` are facts only observable while the DOM is in
+     *   front of us; they tell the renderer how to lay the passage out later.
+     *
      * @returns a delivery-ready anchor, or `{ ok: false, reason }` when the
      *   selection is empty, outside a message node, or spans several messages.
      */
     function readAnchor(range) {
       if (!range) return { ok: false, reason: 'empty' };
-      const text = intervalText(range);
-      if (text.trim() === '') return { ok: false, reason: 'empty' };
+      const rawText = (() => {
+        try {
+          return String(range.toString());
+        } catch {
+          return '';
+        }
+      })();
+      const normalized = rawText.replace(/\s+/g, ' ');
+      const text = normalized.trim() === '' ? '' : normalized;
+      if (text === '') return { ok: false, reason: 'empty' };
 
       const startElement = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
       const endElement = range.endContainer.nodeType === 1 ? range.endContainer : range.endContainer.parentElement;
@@ -350,16 +527,24 @@ window.__ModuleLoader__.load({
 
       const truncated = text.length > MAX_CHARS;
       const quote = truncated ? text.slice(0, MAX_CHARS) : text;
+      // The raw form is cut at the same place, so the two stay the same passage.
+      const rawQuote = truncated ? rawText.slice(0, Math.max(MAX_CHARS, quote.length)) : rawText;
 
       let offset = -1;
+      let rawOffset = -1;
       try {
         const before = document.createRange();
         before.selectNodeContents(source);
         before.setEnd(range.startContainer, range.startOffset);
-        offset = String(before.toString()).replace(/\s+/g, ' ').length;
+        const beforeText = String(before.toString());
+        rawOffset = beforeText.length;
+        offset = beforeText.replace(/\s+/g, ' ').length;
       } catch {
         offset = -1;
+        rawOffset = -1;
       }
+
+      const singleBlock = blockKindOf(startElement) === blockKindOf(endElement) ? blockKindOf(startElement) : 'prose';
 
       return {
         ok: true,
@@ -371,11 +556,17 @@ window.__ModuleLoader__.load({
           turn: Number(source.getAttribute('data-chat-turn') ?? 0) || 0,
           seq: 0,
           offset,
+          rawOffset,
+          rawLength: rawQuote.length,
           quote,
+          rawQuote,
+          block: singleBlock,
+          lang: singleBlock === 'code' ? codeLanguageOf(startElement) : '',
+          partial: false,
           prefix: text.slice(0, QUOTE_CONTEXT),
           suffix: text.slice(-QUOTE_CONTEXT),
         },
-        text: truncated ? `${quote}…` : quote,
+        text: rawQuote,
         truncated,
       };
     }
@@ -407,19 +598,22 @@ window.__ModuleLoader__.load({
     //#region jumping back
 
     /**
-     * Index a message node's rendered text the way the browser reports a selection.
+     * Index a message node's rendered text.
      *
-     * The index must agree with `Range.toString()` character for character, or a
-     * stored quote lands a few characters off — which is exactly what happens when
-     * a markdown block structure (paragraphs, list items, headings, breaks) is
-     * reconstructed with separators the browser never emits. So the raw text is
-     * the concatenation of its text nodes, with no separator inserted, and the
-     * normalized form is the same `/\s+/g -> ' '` the selection reader applies.
+     * Three views of the same nodes, because three callers need different things:
      *
-     * Every offset the plugin stores or resolves is in the normalized space, with
-     * a one-to-one raw mapping for the blocks that boundary inserts whitespace
-     * into (paragraphs, list items, code fences) and a proportional mapping inside
-     * the rest, so a quote always resolves back to the text the user sees.
+     * - `raw` is the text nodes concatenated exactly as the DOM serializes them,
+     *   which is what `Range.toString()` returns for a whole-row selection. A
+     *   stored raw quote that came from this row matches at one unique offset, so
+     *   `index.raw.indexOf(rawQuote)` is an exact answer rather than an estimate.
+     * - `spaced` is `raw` with every whitespace run collapsed to one space, the
+     *   same normalization the selection reader applies. It locates quotes whose
+     *   original whitespace changed (a re-rendered block, a collapsed blank line).
+     * - `packed` is the earlier, browser-like packing. It is kept because existing
+     *   pins were resolved against it.
+     *
+     * Each normalized view carries a map back to raw offsets, so any located
+     * interval resolves to a live Range — the only thing the highlighter accepts.
      */
     function indexText(root) {
       const nodes = [];
@@ -448,51 +642,67 @@ window.__ModuleLoader__.load({
         node = walker.nextNode();
       }
 
-      // normalized text plus the raw offset each normalized offset came from.
-      let packed = '';
-      const map = [0];
-      for (let at = 0; at < raw.length; ) {
-        if (/\s/.test(raw[at])) {
-          const from = at;
-          while (at < raw.length && /\s/.test(raw[at])) at += 1;
-          const spansNodes = nodes.some((entry) => from < entry.start && at > entry.start);
-          const boundary = spansNodes || /\s/.test(raw[from - 1] ?? ' ') || /\s/.test(raw[at] ?? ' ');
-          if (boundary) {
-            map[map.length - 1] = from;
-            packed += ' ';
-            map.push(at);
-          } else {
-            map[map.length - 1] = from;
+      const buildRunView = (collapseAll) => {
+        let text = '';
+        const map = [0];
+        for (let at = 0; at < raw.length; ) {
+          if (/\s/.test(raw[at])) {
+            const from = at;
+            while (at < raw.length && /\s/.test(raw[at])) at += 1;
+            const spansNodes = nodes.some((entry) => from < entry.start && at > entry.start);
+            const boundary = collapseAll || spansNodes || /\s/.test(raw[from - 1] ?? ' ') || /\s/.test(raw[at] ?? '');
+            if (boundary) {
+              map[map.length - 1] = from;
+              text += ' ';
+              map.push(at);
+            } else {
+              map[map.length - 1] = from;
+            }
+            continue;
           }
-          continue;
+          text += raw[at];
+          map.push(at + 1);
+          at += 1;
         }
-        packed += raw[at];
-        map.push(at + 1);
-        at += 1;
-      }
+        return { text, map };
+      };
+
+      const packedView = buildRunView(false);
+      const spacedView = buildRunView(true);
+
+      const rangeForRaw = (from, to) => {
+        if (nodes.length === 0 || to <= from) return null;
+        const first = nodes.find((entry) => from >= entry.start && from < entry.end);
+        if (!first) return null;
+        const last = nodes.find((entry) => to > entry.start && to <= entry.end) ?? first;
+        try {
+          const range = document.createRange();
+          range.setStart(first.node, from - first.start);
+          range.setEnd(last.node, Math.max(0, Math.min(to - last.start, last.node.nodeValue.length)));
+          return range;
+        } catch {
+          return null;
+        }
+      };
+
+      const rangeForView = (view, start, end) => {
+        if (nodes.length === 0 || view.text.length === 0) return null;
+        const from = view.map[Math.max(0, Math.min(start, view.text.length))];
+        const to = view.map[Math.max(0, Math.min(end, view.text.length))];
+        if (from === undefined || to === undefined) return null;
+        return rangeForRaw(from, to);
+      };
 
       return {
         raw,
-        packed,
+        packed: packedView.text,
+        packedMap: packedView.map,
+        spaced: spacedView.text,
+        spacedMap: spacedView.map,
         nodes,
-        /** Resolve an interval in normalized text back to a live DOM Range, or `null`. */
-        rangeFor(start, end) {
-          if (nodes.length === 0 || packed.length === 0) return null;
-          const from = map[Math.max(0, Math.min(start, packed.length))];
-          const to = map[Math.max(0, Math.min(end, packed.length))];
-          if (from === undefined || to === undefined || to <= from) return null;
-          const first = nodes.find((entry) => from >= entry.start && from < entry.end);
-          if (!first) return null;
-          const last = nodes.find((entry) => to > entry.start && to <= entry.end) ?? first;
-          try {
-            const range = document.createRange();
-            range.setStart(first.node, from - first.start);
-            range.setEnd(last.node, Math.max(0, Math.min(to - last.start, last.node.nodeValue.length)));
-            return range;
-          } catch {
-            return null;
-          }
-        },
+        rangeFor: (start, end) => rangeForView(packedView, start, end),
+        rangeForSpaced: (start, end) => rangeForView(spacedView, start, end),
+        rangeForRaw,
       };
     }
 
@@ -541,7 +751,7 @@ window.__ModuleLoader__.load({
      * Only the Session on screen is marked, so switching Sessions never claims
      * pins that belong elsewhere.
      */
-    const markerState = { sessionId: null, refreshTimer: null, observer: null, indexCache: new WeakMap() };
+    const markerState = { sessionId: null, refreshTimer: null, refreshSoon: false, observer: null, indexCache: new WeakMap(), applying: false };
 
     /** Per-row text index, reused until the row's DOM changes (the observer clears it). */
     function cachedIndex(row) {
@@ -566,50 +776,119 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Locate one stored quote inside an indexed row.
+     * Locate one stored passage inside an indexed row.
      *
-     * An exact match wins; otherwise the stored relative offset is used as a hint
-     * over a small window, which survives the whitespace differences that a
-     * re-rendered markdown block can introduce. `widen` grows a short quote to the
-     * surrounding word boundaries so a two-word pin is still findable by eye.
+     * The same words often appear more than once in one message — a heading and
+     * the paragraph under it, a repeated term — so "the first match wins" marks the
+     * wrong place. Every candidate occurrence is therefore scored against the
+     * stored offset and the closest one is chosen, and the resolved range is
+     * verified to be that passage before it is returned.
      *
-     * @returns `{ range, verdict }` — `verdict` is `'exact'` for a quote match and
-     *   `'message'` when only the hint found it.
+     * Search order, most precise first:
+     *   1. the raw quote, which is exact for a pin whose row has not changed;
+     *   2. the normalized quote against the same whitespace-collapsed view the
+     *      selection reader used;
+     *   3. the browser-like packed view, which is what existing pins were resolved
+     *      against.
+     *
+     * `widen` grows a short quote to the surrounding word boundaries so a two-word
+     * pin is still findable by eye; the widening is re-verified so it can never
+     * drift onto neighbouring words.
+     *
+     * @returns `{ range, verdict }` — `'exact'` for a quote match, `'message'` when
+     *   the passage could not be found (the caller then highlights the message).
      */
     function locateQuote(row, pin, widen) {
       try {
         const index = cachedIndex(row);
-        const quote = pin?.anchor?.quote ?? '';
-        if (quote === '') return { range: null, verdict: 'message' };
-        let found = index.packed.indexOf(quote);
-        let verdict = found >= 0 ? 'exact' : 'message';
-        if (found < 0) {
-          const at = typeof pin.anchor?.offset === 'number' ? pin.anchor.offset : -1;
-          if (at < 0) return { range: null, verdict: 'message' };
-          const from = Math.max(0, at - 24);
-          const relative = index.packed.slice(from, at + quote.length + 24).indexOf(quote);
-          if (relative < 0) return { range: null, verdict: 'message' };
-          found = from + relative;
-        }
-        let length = quote.length;
-        if (widen && length < 24) {
-          const left = index.packed.lastIndexOf(' ', found);
-          if (left >= 0 && found - left < 8) {
-            length += found - left - 1;
-            found = left + 1;
+        const anchor = pin?.anchor ?? {};
+        const rawQuote = typeof anchor.rawQuote === 'string' && anchor.rawQuote !== '' ? anchor.rawQuote : '';
+        const normQuote = typeof anchor.quote === 'string' ? anchor.quote : '';
+        if (rawQuote === '' && normQuote === '') return { range: null, verdict: 'message' };
+
+        const hint = typeof anchor.offset === 'number' && anchor.offset >= 0 ? anchor.offset : -1;
+        const near = hint < 0 ? 0 : Math.max(0, hint - LOCATE_WINDOW);
+        const far = hint < 0 ? Number.MAX_SAFE_INTEGER : hint + (normQuote.length || 0) + LOCATE_WINDOW;
+
+        /** Collect every occurrence of `needle` in `text`, closest to `hint` first. */
+        const occurrences = (text, needle) => {
+          const hits = [];
+          if (needle === '' || text === '') return hits;
+          let at = text.indexOf(needle);
+          while (at >= 0 && hits.length < 200) {
+            hits.push(at);
+            at = text.indexOf(needle, at + 1);
           }
-          const right = index.packed.indexOf(' ', found + length);
-          if (right >= 0 && right - (found + length) < 8) length = right - found;
+          if (hint < 0 || hits.length < 2) return hits;
+          return hits.sort((a, b) => Math.abs(a - hint) - Math.abs(b - hint));
+        };
+
+        const candidates = [];
+        for (const at of occurrences(index.raw, rawQuote)) {
+          candidates.push({ mode: 'raw', at, length: rawQuote.length, delta: 0, verdict: 'exact' });
         }
-        return { range: index.rangeFor(found, found + length), verdict };
-      } catch {
+        for (const at of occurrences(index.spaced, normQuote)) {
+          candidates.push({ mode: 'spaced', at, length: normQuote.length, delta: Math.abs(at - hint), verdict: 'exact' });
+        }
+        for (const at of occurrences(index.packed, normQuote)) {
+          candidates.push({ mode: 'packed', at, length: normQuote.length, delta: Math.abs(at - hint) + 1, verdict: 'exact' });
+        }
+
+        let best = null;
+        for (const candidate of candidates) {
+          if (candidate.mode === 'raw' && hint >= 0) candidate.delta = Math.abs(candidate.at - (anchor.rawOffset ?? hint));
+          if (hint >= 0 && candidate.mode !== 'raw' && (candidate.at < near || candidate.at > far)) continue;
+          if (best === null || candidate.delta < best.delta) best = candidate;
+        }
+        if (best === null) return { range: null, verdict: 'message' };
+
+        const view = best.mode === 'raw' ? null : best.mode === 'spaced' ? index.spaced : index.packed;
+        const toRawOffset = (position) => {
+          if (best.mode === 'raw') return position;
+          const map = best.mode === 'spaced' ? index.spacedMap : index.packedMap;
+          const mapped = map?.[position];
+          return typeof mapped === 'number' ? mapped : position;
+        };
+
+        let start = best.at;
+        let length = best.length;
+        if (widen && length < 24) {
+          const text = view ?? index.raw;
+          const left = text.lastIndexOf(' ', start);
+          if (left >= 0 && start - left < 8) {
+            length += start - left - 1;
+            start = left + 1;
+          }
+          const right = text.indexOf(' ', start + length);
+          if (right >= 0 && right - (start + length) < 8) length = right - start;
+        }
+
+        const range = best.mode === 'raw'
+          ? index.rangeForRaw(start, start + length)
+          : best.mode === 'spaced'
+            ? index.rangeForSpaced(start, start + length)
+            : index.rangeFor(start, start + length);
+        if (!range) return { range: null, verdict: 'message' };
+
+        // Final check: the resolved range must actually read as the stored passage.
+        // A mismatch means the mapping drifted, and marking the message beats
+        // marking the wrong words.
+        const expected = (view ?? index.raw).slice(start, start + length);
+        const actual = (() => {
+          try {
+            return String(range.toString()).replace(/\s+/g, ' ');
+          } catch {
+            return '';
+          }
+        })();
+        const wanted = best.mode === 'raw' ? expected.replace(/\s+/g, ' ') : expected;
+        if (actual !== wanted) return { range: null, verdict: 'message' };
+
+        return { range, verdict: best.verdict, offset: toRawOffset(start) };
+      } catch (error) {
+        console.error('[dsh-pins] 定位固定片段失败', error);
         return { range: null, verdict: 'message' };
       }
-    }
-
-    /** The marker pass widens short quotes; the jump pass does not. */
-    function rangeForPin(row, pin) {
-      return locateQuote(row, pin, true).range;
     }
 
     function unwrapMarks() {
@@ -625,33 +904,65 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Marking outcome per pin id, rewritten by every marker pass.
+     *
+     * A pin whose passage cannot be re-located while its message *is* on screen is
+     * a defect worth showing: the card says so instead of silently losing its mark.
+     * `pending` means the message is not mounted (scrolled away or paged out), which
+     * is normal and must not be reported as a failure.
+     */
+    const markerReport = new Map();
+
+    function reportMarker(id, status) {
+      if (markerReport.get(id) === status) return;
+      markerReport.set(id, status);
+      PINS_EVENTS.dispatchEvent(new Event('markers'));
+    }
+
     function applyMarkers() {
-      try {
-        markerState.observer?.disconnect();
-      } catch {
-        /* the observer is optional */
-      }
+      // The observer stays connected while the pass runs. Disconnecting it left a
+      // window in which an edit inside a marked row went unnoticed and the marks
+      // stayed stale; the re-entrancy guard below is what prevents the pass from
+      // scheduling itself.
+      if (markerState.applying) return;
+      markerState.applying = true;
       try {
         const sessionId = markerState.sessionId;
         const registry = globalThis.CSS?.highlights;
         const canUseHighlight = Boolean(registry) && typeof globalThis.Highlight === 'function';
 
         const ranges = [];
+        const seen = new Set();
         if (sessionId) {
           const rows = markedRows();
           for (const pin of store.list(sessionId)) {
+            seen.add(pin.id);
             const row = rows.find(
               (candidate) =>
                 candidate.getAttribute('data-chat-flow-key') === pin.anchor?.flowKey ||
                 candidate.getAttribute('data-chat-anchor-key') === pin.anchor?.flowKey,
             );
-            if (!row) continue;
-            const range = rangeForPin(row, pin);
-            if (range) ranges.push(range);
+            if (!row) {
+              reportMarker(pin.id, 'pending');
+              continue;
+            }
+            const located = locateQuote(row, pin, true);
+            if (located.range) {
+              ranges.push(located.range);
+              reportMarker(pin.id, 'ok');
+            } else {
+              reportMarker(pin.id, 'miss');
+            }
           }
+        }
+        for (const id of [...markerReport.keys()]) {
+          if (!seen.has(id)) markerReport.delete(id);
         }
 
         if (canUseHighlight) {
+          // Replacing the registry entry in one call keeps the previous marks
+          // visible until the new ones are ready, so a refresh never blanks them.
           if (ranges.length > 0) registry.set('dsh-pins-mark', new globalThis.Highlight(...ranges));
           else registry.delete('dsh-pins-mark');
         } else {
@@ -669,37 +980,83 @@ window.__ModuleLoader__.load({
       } catch (error) {
         console.error('[dsh-pins] 绘制固定标记失败', error);
       } finally {
-        try {
-          markerState.observer?.observe(document.body, { childList: true, subtree: true, characterData: true });
-        } catch {
-          /* observing is best-effort */
-        }
+        markerState.applying = false;
       }
     }
 
-    function scheduleMarkers() {
+    /**
+     * Ask for the marks to be redrawn.
+     *
+     * `immediate` skips the coalescing delay and is what the DOM watcher asks for,
+     * because that is the case the user sees as a lag. The cache of affected rows is
+     * dropped by the watcher itself, so this only schedules work. The pass runs out
+     * of a timer rather than synchronously so several mutations in one frame cost
+     * one redraw, and so a throw inside the pass cannot leave the scheduler
+     * believing a refresh is still pending.
+     */
+    function scheduleMarkers(immediate) {
+      if (markerState.refreshSoon === true) return;
+      markerState.refreshSoon = immediate === true;
       if (markerState.refreshTimer !== null) return;
-      // The document changed, so every cached text index may be stale.
-      markerState.indexCache = new WeakMap();
       markerState.refreshTimer = window.setTimeout(() => {
         markerState.refreshTimer = null;
-        applyMarkers();
-      }, 250);
+        markerState.refreshSoon = false;
+        try {
+          applyMarkers();
+        } catch (error) {
+          console.error('[dsh-pins] 标记刷新失败，下次 DOM 变化时会重试', error);
+        }
+      }, immediate === true ? 0 : 120);
     }
 
     function setMarkedSession(sessionId) {
       const next = sessionId === undefined || sessionId === null ? null : String(sessionId);
       if (markerState.sessionId === next) {
-        scheduleMarkers();
+        scheduleMarkers(false);
         return;
       }
       markerState.sessionId = next;
-      applyMarkers();
+      // A different conversation means every cached row belongs to another session.
+      markerState.indexCache = new WeakMap();
+      scheduleMarkers(false);
     }
 
     function startMarkerWatch() {
       try {
-        markerState.observer = new MutationObserver(scheduleMarkers);
+        markerState.observer = new MutationObserver((records) => {
+          // Only an edit that touches a row we indexed can invalidate anything.
+          // React re-renders the frame constantly (composer state, streaming
+          // tokens, scroll affordances), and treating all of it as a change made
+          // every pass rebuild the whole conversation's indexes.
+          let touched = false;
+          outer: for (const record of records) {
+            const node = record.target;
+            const row = node?.nodeType === 1 ? node : node?.parentElement;
+            if (!row) continue;
+            if (markerState.indexCache.has(row)) {
+              markerState.indexCache.delete(row);
+              touched = true;
+              continue;
+            }
+            const owner = row.closest?.('[data-chat-flow-key],[data-chat-anchor-key]');
+            if (owner && markerState.indexCache.has(owner)) {
+              markerState.indexCache.delete(owner);
+              touched = true;
+              continue;
+            }
+            // A row that is not cached yet may still be a newly mounted message.
+            if (record.addedNodes?.length > 0) {
+              for (const added of record.addedNodes) {
+                const element = added.nodeType === 1 ? added : added.parentElement;
+                if (element?.closest?.('[data-chat-flow-key],[data-chat-anchor-key]')) {
+                  touched = true;
+                  break outer;
+                }
+              }
+            }
+          }
+          if (touched) scheduleMarkers(true);
+        });
         markerState.observer.observe(document.body, { childList: true, subtree: true, characterData: true });
       } catch (error) {
         console.error('[dsh-pins] 无法监听对话变化，标记只在固定时刷新', error);
@@ -793,6 +1150,40 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Bring one located Range into the middle of the conversation's scrollport.
+     *
+     * This is the precise jump: several pins can share one message, so the text the
+     * user clicked is the only useful target. The computed position is clamped to
+     * the scrollport's own range, which is what makes a passage near the end of the
+     * conversation land at the bottom instead of being pushed up by an impossible
+     * "centre" request, and the mirror case at the top.
+     *
+     * @returns whether the range had a usable box and the scroll was written.
+     */
+    function scrollToRange(range) {
+      if (!range) return false;
+      let box = null;
+      try {
+        box = range.getBoundingClientRect();
+      } catch {
+        return false;
+      }
+      // A collapsed or not-yet-laid-out range has no box worth scrolling to.
+      if (!box || (box.height === 0 && box.width === 0)) return false;
+      const scroller = findScroller();
+      if (!scroller) return false;
+      const anchorTop = box.top - scroller.getBoundingClientRect().top;
+      const target = scroller.scrollTop + anchorTop - Math.max(0, (scroller.clientHeight - box.height) / 2);
+      const clamped = Math.max(0, Math.min(target, Math.max(0, scroller.scrollHeight - scroller.clientHeight)));
+      try {
+        scroller.scrollTo({ top: clamped, behavior: 'smooth' });
+      } catch {
+        scroller.scrollTop = clamped;
+      }
+      return true;
+    }
+
+    /**
      * Ask the Session to page history back through one sequence number, then give
      * the Conversation a moment to mount the row.
      *
@@ -824,6 +1215,12 @@ window.__ModuleLoader__.load({
     /**
      * Scroll a pinned passage back into view and mark it.
      *
+     * The passage — not its message — is what gets centred. One message may hold
+     * several pins, and centring the message would send every one of them to the
+     * same middling position and leave the user hunting for the words they clicked.
+     * When the passage cannot be located, the message is centred instead, which is
+     * still the honest answer.
+     *
      * @returns `'exact'` when the quote was re-anchored inside the message,
      *   `'message'` when only the message could be located, `'missing'` when the
      *   message is not in the loaded window.
@@ -845,7 +1242,8 @@ window.__ModuleLoader__.load({
             frames += 1;
             const late = findFlowRow(flowKey);
             if (late) {
-              scrollToRow(late);
+              const lateLocated = locateQuote(late, pin, false);
+              scrollToRange(lateLocated.range) || scrollToRow(late);
               return;
             }
             if (frames < 120) window.requestAnimationFrame(retry);
@@ -857,7 +1255,7 @@ window.__ModuleLoader__.load({
 
       const located = locateQuote(row, pin, false);
 
-      scrollToRow(row);
+      if (!(located.range && scrollToRange(located.range))) scrollToRow(row);
       row.setAttribute('data-dsh-pins-flash', '');
       if (located.range) flashRange(located.range);
       window.setTimeout(() => row.removeAttribute('data-dsh-pins-flash'), 2000);
@@ -897,6 +1295,9 @@ window.__ModuleLoader__.load({
 .dsh-pins-root .search input{flex:1;min-width:0;height:26px;padding:0 9px;border:1px solid var(--dsw-alias-border-l1);
   border-radius:7px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none}
 .dsh-pins-root .search input:focus{border-color:var(--dsw-alias-border-l2)}
+.dsh-pins-root .search .clear{width:22px;height:22px;flex:none;display:inline-flex;align-items:center;justify-content:center;
+  border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;cursor:pointer}
+.dsh-pins-root .search .clear:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .dsh-pins-root .count{font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}
 .dsh-pins-root .scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:8px}
 .dsh-pins-root .group{margin:0 0 2px;padding:6px 6px 2px;font-size:11px;color:var(--dsw-alias-label-tertiary);
@@ -911,24 +1312,66 @@ window.__ModuleLoader__.load({
   color:var(--dsw-alias-label-tertiary)}
 .dsh-pins-card .dot{width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);flex:none}
 .dsh-pins-card[data-kind="user"] .dot{background:var(--dsw-alias-brand-primary)}
-.dsh-pins-card .txt{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;
-  font-size:12px;line-height:17px;word-break:break-word}
-.dsh-pins-card[data-lines="1"] .txt{-webkit-line-clamp:1}
-.dsh-pins-card[data-lines="2"] .txt{-webkit-line-clamp:2}
+.dsh-pins-card .txt{white-space:pre-wrap;overflow-wrap:anywhere;overflow:hidden;
+  max-height:calc(3 * (17px + var(--dsh-content-font-delta, 0px)));
+  font-size:12px;line-height:calc(17px + var(--dsh-content-font-delta, 0px))}
+/* Code keeps its own layout: no collapsing of indentation, monospace metrics. */
+.dsh-pins-card .txt-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:11.5px;line-height:calc(16px + var(--dsh-content-font-delta, 0px));
+  white-space:pre;overflow-x:hidden;
+  max-height:calc(3 * (16px + var(--dsh-content-font-delta, 0px)))}
+.dsh-pins-card[data-lines="1"] .txt{max-height:calc(1 * (17px + var(--dsh-content-font-delta, 0px)))}
+.dsh-pins-card[data-lines="2"] .txt{max-height:calc(2 * (17px + var(--dsh-content-font-delta, 0px)))}
+.dsh-pins-card[data-lines="1"] .txt-code{max-height:calc(1 * (16px + var(--dsh-content-font-delta, 0px)))}
+.dsh-pins-card[data-lines="2"] .txt-code{max-height:calc(2 * (16px + var(--dsh-content-font-delta, 0px)))}
+.dsh-pins-card .meta .warn{color:var(--dsw-alias-state-warn-primary)}
 .dsh-pins-card .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+/* Filter chips: ellipsised, because the row must stay one line and the tooltip
+   carries the full name. The tag *manager* deliberately does the opposite. */
 .dsh-pins-root .tag{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 6px;
   border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);
   font-size:10px;cursor:pointer}
 .dsh-pins-root .tag:hover{color:var(--dsw-alias-label-primary)}
 .dsh-pins-root .tag[data-on]{background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
+.dsh-pins-root .tagbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.dsh-pins-root .tagbar-chips{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
+.dsh-pins-root .tagbar-clear{flex:none;height:20px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
+  border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10px;cursor:pointer}
+.dsh-pins-root .tagbar-clear:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2)}
+
+/* Collapsible tag manager: one row per tag, full name, trash beside it. */
+.dsh-pins-root .tagmgr{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
+.dsh-pins-root .tagmgr-head{display:flex;align-items:center;gap:6px;width:100%;height:26px;padding:0 8px;border:none;
+  border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;cursor:pointer;text-align:left}
+.dsh-pins-root .tagmgr-head:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2)}
+.dsh-pins-root .tagmgr-head .chev{width:10px;flex:none;color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-root .tagmgr-head .badge{margin-left:auto;padding:0 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);
+  color:var(--dsw-alias-label-tertiary);font-size:10px}
+.dsh-pins-root .tagmgr-body{display:flex;flex-direction:column;gap:1px;padding:2px 4px 6px}
+.dsh-pins-root .tagmgr-row{display:flex;align-items:center;gap:6px;min-height:24px;padding:0 4px;border-radius:6px}
+.dsh-pins-root .tagmgr-row:hover{background:var(--dsw-alias-bg-layer-2)}
+.dsh-pins-root .tagmgr-row[data-active]{background:var(--dsw-alias-bg-layer-2)}
+.dsh-pins-root .tagmgr-name{flex:1;min-width:0;word-break:break-all;padding:2px 0;text-align:left;font-size:11px;
+  color:var(--dsw-alias-label-primary);background:transparent;border:none;font-family:inherit}
+.dsh-pins-root .tagmgr-name.filter{cursor:pointer}
+.dsh-pins-root .tagmgr-name.filter:hover{color:var(--dsw-alias-brand-primary)}
+.dsh-pins-root .tagmgr-count{flex:none;font-size:10px;color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-root .tagmgr-del{flex:none;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;
+  border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;cursor:pointer}
+.dsh-pins-root .tagmgr-del:hover{background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-state-error-primary)}
+.dsh-pins-root .tagmgr-hint{padding:4px 4px 0;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1.5}
+.dsh-pins-root .tagmgr-empty{padding:4px;color:var(--dsw-alias-label-tertiary);font-size:11px}
+
+/* The card's tag editor: chips on their own wrapped row, input on its own line. */
+.dsh-pins-root .tagrow-chips{display:flex;flex-wrap:wrap;gap:4px}
 .dsh-pins-card .ops{position:absolute;top:5px;right:5px;display:none;gap:2px}
 .dsh-pins-card:hover .ops,.dsh-pins-card:focus-within .ops{display:flex}
 .dsh-pins-card .ops button{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;
   border:none;border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);
   font:inherit;font-size:12px;cursor:pointer}
 .dsh-pins-card .ops button:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}
-.dsh-pins-card .tagrow{display:flex;gap:4px;margin-top:5px}
-.dsh-pins-card .tagrow input{width:100%;height:24px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
+.dsh-pins-card .tagrow{display:flex;flex-direction:column;gap:6px;margin-top:6px}
+.dsh-pins-card .tagrow input{width:100%;box-sizing:border-box;height:26px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
   border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none}
 .dsh-pins-root .empty{margin:22px 14px;color:var(--dsw-alias-label-tertiary);line-height:1.8;text-align:center}
 .dsh-pins-root .empty b{display:block;margin-bottom:6px;color:var(--dsw-alias-label-secondary)}
@@ -1022,7 +1465,6 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                   setTagging(false);
                 }
               },
-              onBlur: () => setTagging(false),
             }),
           );
         } else {
@@ -1045,6 +1487,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           className: 'dsh-pins-bar',
           style: { top: `${Math.max(8, Math.round(top))}px`, left: `${Math.round(left)}px` },
           onMouseDown: (event) => event.preventDefault(),
+          // Leaving the bar puts the tag editor away, so clicking anywhere else in
+          // the app dismisses it. Moving focus between the bar's own buttons keeps
+          // it open.
+          onBlur: (event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) setTagging(false);
+          },
         },
         buttons,
       );
@@ -1098,7 +1546,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       }, [context, liveSession]);
 
       // A new pin (from anywhere, including the panel) redraws the marks.
-      React.useEffect(() => store.subscribe(scheduleMarkers), []);
+      // A pin changed: redraw the marks, without pretending the DOM moved.
+      React.useEffect(() => store.subscribe(() => scheduleMarkers(false)), []);
 
       const accept = React.useCallback(
         (range) => {
@@ -1167,7 +1616,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
           if (action.type === 'copy') {
             try {
-              void navigator.clipboard?.writeText(current.anchor.quote);
+              void navigator.clipboard?.writeText(current.text);
             } catch {
               /* the clipboard can refuse outside a user gesture; copying stays best-effort */
             }
@@ -1191,17 +1640,22 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
           if (action.type === 'pin' || action.type === 'tag') {
             let record = null;
+            let tagAdded = null;
             try {
               const existing = store.find(target, current.anchor);
               record =
                 existing ??
                 store.add(target, {
+                  // `text` is the display form (line breaks kept); `anchor.quote`
+                  // stays the normalized form the locator and search rely on.
                   text: current.text,
                   tags: [],
                   anchor: { ...current.anchor, sessionId: String(target) },
                 });
               if (action.type === 'tag') {
-                store.toggleTag(target, record.id, action.tag);
+                // Adding never removes, so a repeat reports itself instead of
+                // silently detaching the label.
+                tagAdded = store.addTag(target, record.id, action.tag);
               }
             } catch (error) {
               console.error('[dsh-pins] 保存固定失败', error);
@@ -1209,9 +1663,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               return;
             }
             setState(null);
-            scheduleMarkers();
+            scheduleMarkers(false);
             const count = store.count(target);
             const panelProblem = showPanel();
+            if (action.type === 'tag' && tagAdded === false) {
+              say(`已经有 #${action.tag} 这个标签了`);
+              return;
+            }
             say(panelProblem !== '' ? `已固定 ${count} 条 · ${panelProblem}` : `已固定 ${count} 条（原文已加标记）`);
           }
         },
@@ -1296,16 +1754,105 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#endregion
 
+    //#region tags
+
+    /** One-line explanation shown inside every tag manager panel. */
+    const TAG_MANAGER_HINT = '点标签名或垃圾桶 = 删除这个标签（片段本身不会删）';
+
+    function announce(text) {
+      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: text }));
+    }
+
+    /**
+     * A collapsible tag manager.
+     *
+     * Tags are listed one per row with their full name, how many pins carry them,
+     * and a trash button — the "long names get ellipsised" treatment used for
+     * filtering chips is wrong here, because a delete control whose label you cannot
+     * read is a control you cannot use.
+     *
+     * One component serves both scopes: a pin card passes that pin's tags, the panel
+     * header passes every tag of the Session (or of every Session, in the overview).
+     */
+    function TagManager({ title, tags, countOf, onDelete, onToggleFilter, activeTags, startOpen, testId }) {
+      const [open, setOpen] = React.useState(startOpen === true);
+      return h(
+        'div',
+        { className: 'tagmgr', 'data-cmp': testId ?? 'tagmgr' },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'tagmgr-head',
+            'aria-expanded': open ? 'true' : 'false',
+            onClick: () => setOpen((value) => !value),
+          },
+          h('span', { className: 'chev' }, open ? '▾' : '▸'),
+          h('span', null, title),
+          h('span', { className: 'badge' }, tags.length),
+        ),
+        open
+          ? h(
+              'div',
+              { className: 'tagmgr-body' },
+              tags.length === 0
+                ? h('div', { className: 'tagmgr-empty' }, '这个范围里还没有标签')
+                : tags.map((tag) => {
+                    const count = typeof countOf === 'function' ? countOf(tag) : 0;
+                    const active = activeTags ? activeTags[tag] === true : false;
+                    return h(
+                      'div',
+                      { key: tag, className: 'tagmgr-row', 'data-active': active ? '' : undefined },
+                      // The name doubles as the filter in the panel header scope; in a
+                      // card scope it is plain text, so nothing invites a click that
+                      // would do nothing.
+                      onToggleFilter
+                        ? h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'tagmgr-name filter',
+                              title: active ? '取消这个筛选' : '只看带这个标签的片段',
+                              onClick: () => onToggleFilter(tag),
+                            },
+                            `#${tag}`,
+                          )
+                        : h('span', { className: 'tagmgr-name' }, `#${tag}`),
+                      count > 0 ? h('span', { className: 'tagmgr-count' }, `×${count}`) : null,
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'tagmgr-del',
+                          title: `删除标签 #${tag}`,
+                          'aria-label': `删除标签 ${tag}`,
+                          onClick: () => onDelete(tag),
+                        },
+                        '🗑',
+                      ),
+                    );
+                  }),
+              h('div', { className: 'tagmgr-hint' }, TAG_MANAGER_HINT),
+            )
+          : null,
+      );
+    }
+
+    //#endregion
+
     //#region sidebar panel
 
-    function PinCard({ sessionId, pin, current, taggable, onToggleTag, context }) {
+    function PinCard({ sessionId, pin, current, taggable, onTagChange, context }) {
       const [editing, setEditing] = React.useState(false);
       const [draft, setDraft] = React.useState('');
 
       const submit = () => {
         const tag = normalizeTag(draft);
         setDraft('');
-        if (tag !== '') onToggleTag(tag);
+        if (tag === '') return;
+        const added = onTagChange('add', tag);
+        // Adding never removes, so say why nothing happened instead of toggling.
+        if (added === false) announce(`已经有 #${tag} 这个标签了`);
       };
 
       const open = () => {
@@ -1349,7 +1896,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             onClick: (event) => {
               event.stopPropagation();
               try {
-                void navigator.clipboard?.writeText(pin.anchor?.quote ?? pin.text ?? '');
+                // The raw form is what the user selected; the normalized anchor
+                // would paste a code block as one line.
+                void navigator.clipboard?.writeText(pin.anchor?.rawQuote ?? pin.text ?? '');
               } catch {
                 /* best effort */
               }
@@ -1372,17 +1921,22 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         ),
       ].filter(Boolean);
 
+      const bodyClass = pin.anchor?.block === 'code' ? 'txt txt-code' : 'txt';
+      const fullText = pin.text ?? '';
+
       return h(
         'div',
         {
           'data-dsh-pins': '',
           className: 'dsh-pins-card',
           'data-kind': pin.anchor?.kind ?? '',
-          'data-lines': cardLines(pin.text),
+          'data-block': pin.anchor?.block ?? 'prose',
+          'data-truncated': pin.anchor?.partial === true || fullText.length > 600 ? '' : undefined,
+          'data-lines': cardLines(fullText),
           'data-current': current ? '' : undefined,
           role: 'button',
           tabIndex: 0,
-          title: pin.text ?? '',
+          title: fullText,
           onClick: open,
           onKeyDown: (event) => {
             if (event.key === 'Enter' || event.key === ' ') {
@@ -1397,9 +1951,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           h('span', { className: 'dot' }),
           h('span', null, sourceLabel(pin)),
           pin.anchor?.turn ? h('span', null, `第 ${pin.anchor.turn} 轮`) : null,
+          pin.anchor?.block === 'code' ? h('span', null, `代码${pin.anchor.lang ? ` · ${pin.anchor.lang}` : ''}`) : null,
+          (pin.anchor?.partial === true || fullText.length > 600) ? h('span', { className: 'warn' }, '已截断') : null,
+          markerReport.get(pin.id) === 'miss'
+            ? h('span', { className: 'warn', title: '这条消息在屏幕上，但没能定位到选中的文字：请点这条卡片，然后告诉我现象' }, '原文未找到')
+            : null,
           h('span', { style: { marginLeft: 'auto' } }, relTime(pin.pinnedAt)),
         ),
-        h('div', { className: 'txt' }, pin.text ?? ''),
+        h('div', { className: bodyClass }, fullText),
         Array.isArray(pin.tags) && pin.tags.length > 0
           ? h(
               'div',
@@ -1423,21 +1982,35 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         editing
           ? h(
               'div',
-              { className: 'tagrow', onClick: (event) => event.stopPropagation() },
-              // Existing tags are listed here as removable chips, so a mistyped
-              // label can be taken off without deleting the whole pin.
-              (pin.tags ?? []).map((tag) =>
-                h(
-                  'span',
-                  {
-                    key: `edit-${tag}`,
-                    className: 'tag',
-                    title: '点击移除这个标签',
-                    onClick: () => onToggleTag(tag),
-                  },
-                  `#${tag} ✕`,
-                ),
-              ),
+              {
+                className: 'tagrow',
+                onClick: (event) => event.stopPropagation(),
+                // Focus leaving the whole editor closes it, so clicking anywhere else
+                // in the app puts it away. Focus moving *within* it (onto a chip or the
+                // trash buttons) keeps it open.
+                onBlur: (event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget)) setEditing(false);
+                },
+              },
+              // The chip row shows what is attached; the manager below owns removal.
+              (pin.tags ?? []).length > 0
+                ? h(
+                    'div',
+                    { className: 'tagrow-chips' },
+                    (pin.tags ?? []).map((tag) =>
+                      h(
+                        'span',
+                        {
+                          key: `edit-${tag}`,
+                          className: 'tag',
+                          title: `删除 #${tag}`,
+                          onClick: () => onTagChange('remove', tag),
+                        },
+                        `#${tag} ✕`,
+                      ),
+                    ),
+                  )
+                : null,
               h('input', {
                 autoFocus: true,
                 value: draft,
@@ -1452,6 +2025,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                     setEditing(false);
                   }
                 },
+              }),
+              h(TagManager, {
+                title: '管理这个片段的标签',
+                tags: pin.tags ?? [],
+                countOf: () => 0,
+                onDelete: (tag) => onTagChange('remove', tag),
+                testId: 'pin-tag-manager',
               }),
             )
           : null,
@@ -1473,12 +2053,43 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const [tick, setTick] = React.useState(0);
       const [mode, setMode] = React.useState(() => store.getMode());
       const [query, setQuery] = React.useState('');
-      const [tagFilter, setTagFilter] = React.useState('');
+      const [tagFilter, setTagFilter] = React.useState(() => new Set());
       const [notice, setNotice] = React.useState('');
 
+      const toggleTagFilter = React.useCallback((tag) => {
+        setTagFilter((current) => {
+          const next = new Set(current);
+          if (next.has(tag)) next.delete(tag);
+          else next.add(tag);
+          return next;
+        });
+      }, []);
+
+      const matchesTags = React.useCallback(
+        (pin) => {
+          if (tagFilter.size === 0) return true;
+          const carried = pin.tags ?? [];
+          for (const tag of tagFilter) if (carried.includes(tag)) return true;
+          return false;
+        },
+        [tagFilter],
+      );
+
       React.useEffect(() => store.subscribe(() => setTick((value) => value + 1)), []);
+      // Marking outcomes arrive from the frame-wide watcher, not from the store.
       React.useEffect(() => {
-        const onFilter = (event) => setTagFilter(String(event.detail ?? ''));
+        const onMarkers = () => setTick((value) => value + 1);
+        PINS_EVENTS.addEventListener('markers', onMarkers);
+        return () => PINS_EVENTS.removeEventListener('markers', onMarkers);
+      }, []);
+      // Renaming a Session must land here: the title is a projection the Host
+      // broadcasts, and `tick` re-reads it on the next render.
+      React.useEffect(
+        () => subscribeSessionTitle(context, sessionId, () => setTick((value) => value + 1)),
+        [context, sessionId],
+      );
+      React.useEffect(() => {
+        const onFilter = (event) => toggleTagFilter(String(event.detail ?? ''));
         const onNotice = (event) => {
           setNotice(String(event.detail ?? ''));
           window.setTimeout(() => setNotice(''), 3600);
@@ -1489,18 +2100,34 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           PINS_EVENTS.removeEventListener('filter', onFilter);
           PINS_EVENTS.removeEventListener('notice', onNotice);
         };
-      }, []);
+      }, [toggleTagFilter]);
 
-      const tags = React.useMemo(
-        () => (mode === 'all' ? store.allTags() : sessionId ? store.tags(sessionId) : []),
-        [mode, sessionId, tick],
-      );
+      // Manager order: most used first, so the labels worth curating are on top.
+      // The counts are folded once per store version rather than per render, because
+      // the overview scope spans every Session.
+      const tags = React.useMemo(() => {
+        const counts = new Map();
+        const count = (tag) => counts.get(tag) ?? 0;
+        if (mode === 'all') {
+          for (const [id, entry] of store.sessions()) {
+            for (const pin of entry.pins ?? []) {
+              for (const tag of pin.tags ?? []) counts.set(tag, count(tag) + 1);
+            }
+          }
+        } else if (sessionId) {
+          for (const pin of store.list(sessionId)) {
+            for (const tag of pin.tags ?? []) counts.set(tag, count(tag) + 1);
+          }
+        }
+        return [...counts.keys()]
+          .sort((left, right) => count(right) - count(left) || left.localeCompare(right, 'zh-Hans-CN'))
+          .map((tag) => ({ tag, count: count(tag) }));
+      }, [mode, sessionId, tick]);
+
       const visible = React.useMemo(() => {
         if (!sessionId) return [];
-        return store
-          .list(sessionId)
-          .filter((pin) => matchesQuery(pin, query) && (tagFilter === '' || (pin.tags ?? []).includes(tagFilter)));
-      }, [sessionId, query, tagFilter, tick]);
+        return store.list(sessionId).filter((pin) => matchesQuery(pin, query) && matchesTags(pin));
+      }, [sessionId, query, matchesTags, tick]);
 
       // The overview honours the same filters as the per-Session list: search and
       // tag both narrow it, and the counts shown are the surviving ones.
@@ -1508,15 +2135,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         if (mode !== 'all') return [];
         return store
           .sessions()
-          .map(([id, entry]) => [
-            id,
-            entry,
-            entry.pins.filter(
-              (pin) => matchesQuery(pin, query) && (tagFilter === '' || (pin.tags ?? []).includes(tagFilter)),
-            ),
-          ])
+          .map(([id, entry]) => [id, entry, entry.pins.filter((pin) => matchesQuery(pin, query) && matchesTags(pin))])
           .filter(([, , pins]) => pins.length > 0);
-      }, [mode, query, tagFilter, tick]);
+      }, [mode, query, matchesTags, tick]);
 
       const overviewCount = React.useMemo(
         () => overview.reduce((total, [, , pins]) => total + pins.length, 0),
@@ -1544,7 +2165,26 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             value: query,
             placeholder: '搜索固定内容或标签',
             onChange: (event) => setQuery(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                setQuery('');
+              }
+            },
           }),
+          query !== ''
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'clear',
+                  title: '清除搜索',
+                  'aria-label': '清除搜索',
+                  onClick: () => setQuery(''),
+                },
+                '✕',
+              )
+            : null,
           h(
             'span',
             { className: 'count' },
@@ -1554,20 +2194,63 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         tags.length > 0
           ? h(
               'div',
-              { style: { display: 'flex', flexWrap: 'wrap', gap: '4px' } },
-              tags.map((tag) =>
-                h(
-                  'span',
-                  {
-                    key: tag,
-                    className: 'tag',
-                    'data-on': tagFilter === tag ? '' : undefined,
-                    onClick: () => setTagFilter(tagFilter === tag ? '' : tag),
-                  },
-                  `#${tag}`,
+              { className: 'tagbar' },
+              h(
+                'div',
+                { className: 'tagbar-chips' },
+                tags.map(({ tag, count }) =>
+                  h(
+                    'span',
+                    {
+                      key: tag,
+                      className: 'tag',
+                      'data-on': tagFilter.has(tag) ? '' : undefined,
+                      title: `筛选：#${tag}（${count} 条）`,
+                      onClick: () => toggleTagFilter(tag),
+                    },
+                    `#${tag}`,
+                  ),
                 ),
               ),
+              // Unfiltering one pill at a time is the wrong gesture when several are
+              // selected, so the row carries a reset for the whole selection.
+              tagFilter.size > 0
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'tagbar-clear',
+                      title: '清除标签筛选',
+                      onClick: () => setTagFilter(new Set()),
+                    },
+                    `清除筛选 (${tagFilter.size})`,
+                  )
+                : null,
             )
+          : null,
+        tags.length > 0
+          ? h(TagManager, {
+              // Scope-aware: the overview manages tags of every Session, the
+              // per-Session view only its own — deleting from here must not silently
+              // reach into conversations the user is not looking at.
+              title: mode === 'all' ? '管理全部标签' : '管理本对话标签',
+              tags: tags.map((entry) => entry.tag),
+              countOf: (tag) => tags.find((entry) => entry.tag === tag)?.count ?? 0,
+              onDelete: (tag) => {
+                const removed =
+                  mode === 'all' ? store.removeTagEverywhere(undefined, tag) : sessionId ? store.removeTagEverywhere(sessionId, tag) : 0;
+                setTagFilter((current) => {
+                  if (!current.has(tag)) return current;
+                  const next = new Set(current);
+                  next.delete(tag);
+                  return next;
+                });
+                announce(removed > 0 ? `已删除标签 #${tag}（涉及 ${removed} 条片段）` : `标签 #${tag} 已经不在了`);
+              },
+              onToggleFilter: toggleTagFilter,
+              activeTags: Object.fromEntries([...tagFilter].map((tag) => [tag, true])),
+              testId: 'panel-tag-manager',
+            })
           : null,
         notice !== '' ? h('div', { className: 'note' }, notice) : null,
       );
@@ -1590,7 +2273,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                   h(
                     'div',
                     { key: id },
-                    h('div', { className: 'group' }, h('span', null, sessionLabel(entry)), ` · ${pins.length}`),
+                    h('div', { className: 'group' }, h('span', null, sessionLabel({ ...entry, title: readSessionTitle(context, id) })), ` · ${pins.length}`),
                     pins.map((pin) =>
                       h(PinCard, {
                         key: pin.id,
@@ -1598,7 +2281,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                         pin,
                         current: isCurrent && id === sessionId,
                         taggable: false,
-                        onToggleTag: () => {},
+                        // The overview is for reading; a card there does not edit tags,
+                        // and the panel-level manager above it is how one is removed.
+                        onTagChange: () => false,
                         context,
                       }),
                     ),
@@ -1609,8 +2294,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         body = h(
           'div',
           { className: 'empty' },
-          h('b', null, query !== '' || tagFilter !== '' ? '没有匹配的固定片段' : '这一段还没固定过任何内容'),
-          query !== '' || tagFilter !== ''
+          h('b', null, query !== '' || tagFilter.size > 0 ? '没有匹配的固定片段' : '这一段还没固定过任何内容'),
+          query !== '' || tagFilter.size > 0
             ? '换个关键词，或者清掉标签筛选。'
             : h(
                 'span',
@@ -1633,7 +2318,16 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               pin,
               current: false,
               taggable: true,
-              onToggleTag: (tag) => store.toggleTag(sessionId, pin.id, tag),
+              onTagChange: (action, tag) => {
+                if (action === 'add') {
+                  const added = store.addTag(sessionId, pin.id, tag);
+                  if (added) announce(`已加标签 #${tag}`);
+                  return added;
+                }
+                const removed = store.removeTag(sessionId, pin.id, tag);
+                if (removed) announce(`已删除标签 #${tag}`);
+                return removed;
+              },
               context,
             }),
           ),
