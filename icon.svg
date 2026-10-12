@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Pinned passages">
+  <rect x="8" y="12" width="30" height="8" rx="4" fill="#247bbf" opacity="0.30"/>
+  <rect x="8" y="25" width="22" height="8" rx="4" fill="#247bbf" opacity="0.50"/>
+  <rect x="8" y="38" width="27" height="8" rx="4" fill="#247bbf" opacity="0.30"/>
+  <path d="M44 8a3 3 0 0 1 3 3v4.6l4.6 2.7a2.4 2.4 0 0 1-.4 4.3L47 24v9.2l1.9 2.9a1.6 1.6 0 0 1-1.4 2.4H40.5V52a1.5 1.5 0 0 1-3 0V38.5h-7a1.6 1.6 0 0 1-1.4-2.4l1.9-2.9V24l-4.2-1.4a2.4 2.4 0 0 1-.4-4.3L31 15.6V11a3 3 0 0 1 3-3h10Z" fill="#247bbf"/>
+</svg>

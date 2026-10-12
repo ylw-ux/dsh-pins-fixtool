@@ -1,0 +1,5 @@
+# Bundle patch: the row loads ./index.js as the host half; the manifest's
+# `dsh.client` declaration makes the web app load ./client.js as the browser half.
+- insert:
+    - id: dsh-pins
+      name: dsh-pins
