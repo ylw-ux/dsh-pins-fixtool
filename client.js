@@ -364,6 +364,19 @@ window.__ModuleLoader__.load({
         find(sessionId, anchor) {
           return sessionOf(sessionId, false)?.pins.find((pin) => sameAnchor(pin.anchor, anchor));
         },
+        /**
+         * The pin living in one message, if any.
+         *
+         * Tagging a live selection needs this and must not use {@link find}: the
+         * stored quote is normalized while the toolbar carries the raw selection, so
+         * an exact comparison can miss the pin the user just created and silently
+         * create a second one. A tag action always belongs to the message the
+         * selection is in, so the message key is the correct and unambiguous scope.
+         */
+        findByFlowKey(sessionId, flowKey) {
+          if (typeof flowKey !== 'string' || flowKey === '') return undefined;
+          return sessionOf(sessionId, false)?.pins.find((pin) => pin.anchor?.flowKey === flowKey);
+        },
         add(sessionId, pin, title) {
           const entry = sessionOf(sessionId, true);
           // One message holds many pins; only the same passage is a duplicate.
@@ -1286,7 +1299,8 @@ window.__ModuleLoader__.load({
 
 .dsh-pins-root{display:flex;flex-direction:column;height:100%;min-height:0;font-size:12px;
   color:var(--dsw-alias-label-primary);font-family:inherit;background:var(--dsw-specific-sidebar-fill,transparent)}
-.dsh-pins-root .hd{display:flex;flex-direction:column;gap:8px;padding:10px 12px 8px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.dsh-pins-root .hd{display:flex;flex-direction:column;gap:8px;padding:10px 12px 8px;
+  border-bottom:1px solid var(--dsw-alias-border-l1);max-height:70vh;overflow-y:auto;overscroll-behavior:contain}
 .dsh-pins-root .tabs{display:flex;gap:2px;padding:2px;border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
 .dsh-pins-root .tabs button{flex:1;height:24px;border:none;border-radius:6px;background:transparent;
   color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer}
@@ -1348,6 +1362,17 @@ window.__ModuleLoader__.load({
 .dsh-pins-root .tagmgr-head .badge{margin-left:auto;padding:0 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);
   color:var(--dsw-alias-label-tertiary);font-size:10px}
 .dsh-pins-root .tagmgr-body{display:flex;flex-direction:column;gap:1px;padding:2px 4px 6px}
+/* The panel-level manager is bounded and scrolls on its own. Overflow on a flex
+   item also gives it an automatic minimum size of zero, so a long tag list can
+   never push the pin list out of reach. The important flag is what re-establishes
+   that bound after a drag writes an inline height on the manager root. */
+.dsh-pins-root .tagmgr-scroll{overflow-y:auto;overscroll-behavior:contain;
+  max-height:var(--dsh-pins-mgr-height, 200px) !important}
+.dsh-pins-root .tagmgr-resize{display:block;width:100%;height:10px;margin-top:2px;padding:0;border:none;background:transparent;
+  cursor:ns-resize;user-select:none;touch-action:none}
+.dsh-pins-root .tagmgr-resize::after{content:'';display:block;width:32px;height:3px;margin:0 auto;border-radius:999px;
+  background:var(--dsw-alias-border-l2)}
+.dsh-pins-root .tagmgr-resize:hover::after{background:var(--dsw-alias-label-tertiary)}
 .dsh-pins-root .tagmgr-row{display:flex;align-items:center;gap:6px;min-height:24px;padding:0 4px;border-radius:6px}
 .dsh-pins-root .tagmgr-row:hover{background:var(--dsw-alias-bg-layer-2)}
 .dsh-pins-root .tagmgr-row[data-active]{background:var(--dsw-alias-bg-layer-2)}
@@ -1362,8 +1387,11 @@ window.__ModuleLoader__.load({
 .dsh-pins-root .tagmgr-hint{padding:4px 4px 0;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1.5}
 .dsh-pins-root .tagmgr-empty{padding:4px;color:var(--dsw-alias-label-tertiary);font-size:11px}
 
-/* The card's tag editor: chips on their own wrapped row, input on its own line. */
+/* The card's tag editor: a line saying how to delete, the chips, then the input on
+   a line of its own so no number of tags can push it off the card. */
+.dsh-pins-root .tagrow-head{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1.5}
 .dsh-pins-root .tagrow-chips{display:flex;flex-wrap:wrap;gap:4px}
+.dsh-pins-root .tagrow-chips .tag{border:none;font-family:inherit}
 .dsh-pins-card .ops{position:absolute;top:5px;right:5px;display:none;gap:2px}
 .dsh-pins-card:hover .ops,.dsh-pins-card:focus-within .ops{display:flex}
 .dsh-pins-card .ops button{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;
@@ -1642,7 +1670,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             let record = null;
             let tagAdded = null;
             try {
-              const existing = store.find(target, current.anchor);
+              // A tag action belongs to the message the selection is in: matching on
+              // the passage signature here would miss the pin the user just made
+              // (the toolbar carries the raw selection, the pin keeps the normalized
+              // quote) and quietly create a second pin under the same tag.
+              const existing =
+                action.type === 'tag'
+                  ? (store.findByFlowKey(target, current.anchor.flowKey) ?? store.find(target, current.anchor))
+                  : store.find(target, current.anchor);
               record =
                 existing ??
                 store.add(target, {
@@ -1664,12 +1699,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             }
             setState(null);
             scheduleMarkers(false);
-            const count = store.count(target);
-            const panelProblem = showPanel();
             if (action.type === 'tag' && tagAdded === false) {
               say(`已经有 #${action.tag} 这个标签了`);
               return;
             }
+            const count = store.count(target);
+            const panelProblem = showPanel();
             say(panelProblem !== '' ? `已固定 ${count} 条 · ${panelProblem}` : `已固定 ${count} 条（原文已加标记）`);
           }
         },
@@ -1756,8 +1791,52 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#region tags
 
-    /** One-line explanation shown inside every tag manager panel. */
-    const TAG_MANAGER_HINT = '点标签名或垃圾桶 = 删除这个标签（片段本身不会删）';
+    /** One-line explanation shown inside a tag manager panel. */
+    const TAG_MANAGER_HINT = '点标签名或右侧垃圾桶都能删除这个标签（只删标签，片段本身不会删）';
+
+    /**
+     * Interaction guard for the pin card.
+     *
+     * Collapsing an editor on `blur` looks right and is not: `relatedTarget` is null
+     * whenever focus moves to something that cannot take focus (a chip, a hint line,
+     * a plain row), so every such click was read as "focus left the box" and closed
+     * it — which is why clicking a chip to delete it destroyed the editor instead.
+     * Preventing the default of `mousedown` keeps the input focused for any click
+     * inside the card without suppressing the click itself, so the click handlers
+     * still run and the editor stays open until the user leaves the card.
+     */
+    const CARD_GUARD = {
+      onMouseDown: (event) => {
+        const editor = event.currentTarget.querySelector('.tagrow');
+        if (editor && editor.contains(event.target)) event.preventDefault();
+      },
+    };
+
+    /**
+     * The same guard for the panel's own interactive rows: keeping focus is what
+     * lets a user click a tag name or a trash button without the surrounding
+     * surface reacting as if focus had left.
+     */
+    const MGR_GUARD = {
+      onMouseDown: (event) => event.preventDefault(),
+    };
+
+    /** Remembered height of the panel-level tag manager, in px. */
+    const PANEL_HEIGHT_KEY = 'dsh-pins/tagmgr-height';
+    const PANEL_HEIGHT_MIN = 96;
+    const PANEL_HEIGHT_MAX = 420;
+
+    function clampPanelManagerHeight(value) {
+      const ceiling = Math.min(PANEL_HEIGHT_MAX, Math.round(window.innerHeight * 0.6));
+      const floor = Math.min(PANEL_HEIGHT_MIN, ceiling);
+      return Math.max(floor, Math.min(value, ceiling));
+    }
+
+    function readPanelManagerHeight() {
+      const saved = readJson(PANEL_HEIGHT_KEY, null);
+      const value = typeof saved === 'number' && Number.isFinite(saved) ? saved : 200;
+      return clampPanelManagerHeight(value);
+    }
 
     function announce(text) {
       PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: text }));
@@ -1774,11 +1853,11 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * One component serves both scopes: a pin card passes that pin's tags, the panel
      * header passes every tag of the Session (or of every Session, in the overview).
      */
-    function TagManager({ title, tags, countOf, onDelete, onToggleFilter, activeTags, startOpen, testId }) {
+    function TagManager({ title, tags, countOf, onDelete, onToggleFilter, activeTags, startOpen, hint, testId, bodyClass, style }) {
       const [open, setOpen] = React.useState(startOpen === true);
       return h(
         'div',
-        { className: 'tagmgr', 'data-cmp': testId ?? 'tagmgr' },
+        { className: 'tagmgr', 'data-cmp': testId ?? 'tagmgr', style },
         h(
           'button',
           {
@@ -1794,7 +1873,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         open
           ? h(
               'div',
-              { className: 'tagmgr-body' },
+              { className: `tagmgr-body${bodyClass ? ` ${bodyClass}` : ''}` },
               tags.length === 0
                 ? h('div', { className: 'tagmgr-empty' }, '这个范围里还没有标签')
                 : tags.map((tag) => {
@@ -1826,15 +1905,75 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                           className: 'tagmgr-del',
                           title: `删除标签 #${tag}`,
                           'aria-label': `删除标签 ${tag}`,
-                          onClick: () => onDelete(tag),
+                          onClick: (event) => {
+                            event.preventDefault();
+                            onDelete(tag);
+                          },
                         },
                         '🗑',
                       ),
                     );
                   }),
-              h('div', { className: 'tagmgr-hint' }, TAG_MANAGER_HINT),
+              h('div', { className: 'tagmgr-hint' }, hint ?? TAG_MANAGER_HINT),
             )
           : null,
+      );
+    }
+
+    /**
+     * The panel-level tag manager: the same list, with a height the user controls.
+     *
+     * An unbounded tag list is a trap — with enough labels it consumed the whole
+     * panel, so the pins below could not be reached and the only way to remove a
+     * label was to delete the ones above it. The body therefore scrolls on its own
+     * and its height is bounded from the start, and the drag handle lets the user
+     * trade space between the manager and the pin list.
+     */
+    function PanelTagManager({ tags, countOf, onDelete, onToggleFilter, activeTags, title }) {
+      const [height, setHeight] = React.useState(() => readPanelManagerHeight());
+
+      React.useEffect(() => {
+        writeJson(PANEL_HEIGHT_KEY, height);
+      }, [height]);
+
+      const startResize = (event) => {
+        event.preventDefault();
+        const body = event.currentTarget.parentElement?.querySelector('.tagmgr-body');
+        if (!body) return;
+        const from = event.clientY;
+        const start = body.getBoundingClientRect().height;
+        const move = (moveEvent) => setHeight(clampPanelManagerHeight(start + moveEvent.clientY - from));
+        const stop = () => {
+          document.removeEventListener('mousemove', move);
+          document.removeEventListener('mouseup', stop);
+        };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', stop);
+      };
+
+      return h(
+        'div',
+        { ...MGR_GUARD },
+        h(TagManager, {
+          title,
+          tags,
+          countOf,
+          onDelete,
+          onToggleFilter,
+          activeTags,
+          hint: '点右侧垃圾桶删除这个标签（只删标签，片段本身不会删）；点标签名可以筛选',
+          bodyClass: 'tagmgr-scroll',
+          style: { '--dsh-pins-mgr-height': `${Math.round(height)}px` },
+          testId: 'panel-tag-manager',
+        }),
+        h('button', {
+          type: 'button',
+          className: 'tagmgr-resize',
+          title: '上下拖动可以调整这块的高度',
+          'aria-label': '调整标签管理区高度',
+          onMouseDown: startResize,
+          onClick: (event) => event.preventDefault(),
+        }),
       );
     }
 
@@ -1937,6 +2076,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           role: 'button',
           tabIndex: 0,
           title: fullText,
+          ...CARD_GUARD,
           onClick: open,
           onKeyDown: (event) => {
             if (event.key === 'Enter' || event.key === ' ') {
@@ -1985,26 +2125,37 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               {
                 className: 'tagrow',
                 onClick: (event) => event.stopPropagation(),
-                // Focus leaving the whole editor closes it, so clicking anywhere else
-                // in the app puts it away. Focus moving *within* it (onto a chip or the
-                // trash buttons) keeps it open.
+                // The editor closes when focus leaves the card, which `CARD_GUARD`
+                // keeps from firing for clicks inside it.
                 onBlur: (event) => {
                   if (!event.currentTarget.contains(event.relatedTarget)) setEditing(false);
                 },
               },
-              // The chip row shows what is attached; the manager below owns removal.
+              (pin.tags ?? []).length > 0
+                ? h(
+                    'div',
+                    { className: 'tagrow-head' },
+                    '点下面带 ✕ 的标签可以删除它',
+                  )
+                : null,
               (pin.tags ?? []).length > 0
                 ? h(
                     'div',
                     { className: 'tagrow-chips' },
                     (pin.tags ?? []).map((tag) =>
                       h(
-                        'span',
+                        'button',
                         {
                           key: `edit-${tag}`,
+                          type: 'button',
                           className: 'tag',
                           title: `删除 #${tag}`,
-                          onClick: () => onTagChange('remove', tag),
+                          onClick: (event) => {
+                            // Keep the editor's input focused while the chip handles
+                            // its own click, so removal cannot be read as a blur.
+                            event.preventDefault();
+                            onTagChange('remove', tag);
+                          },
                         },
                         `#${tag} ✕`,
                       ),
@@ -2031,6 +2182,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                 tags: pin.tags ?? [],
                 countOf: () => 0,
                 onDelete: (tag) => onTagChange('remove', tag),
+                hint: '点标签名或右侧垃圾桶都能删除这个标签',
                 testId: 'pin-tag-manager',
               }),
             )
@@ -2229,7 +2381,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             )
           : null,
         tags.length > 0
-          ? h(TagManager, {
+          ? h(PanelTagManager, {
               // Scope-aware: the overview manages tags of every Session, the
               // per-Session view only its own — deleting from here must not silently
               // reach into conversations the user is not looking at.
@@ -2249,7 +2401,6 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               },
               onToggleFilter: toggleTagFilter,
               activeTags: Object.fromEntries([...tagFilter].map((tag) => [tag, true])),
-              testId: 'panel-tag-manager',
             })
           : null,
         notice !== '' ? h('div', { className: 'note' }, notice) : null,
