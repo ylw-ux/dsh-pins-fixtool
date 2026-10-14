@@ -1794,16 +1794,16 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 .dsh-pins-return:hover{background:var(--dsw-alias-bg-layer-2)}
 .dsh-pins-bar .btn-quote{color:var(--dsw-alias-label-secondary)}
 
-/* Left sidebar entry: an icon button in the panel row, with a count badge. The size
-   token comes from the host when it publishes one. */
-.dsh-pins-panel-entry{position:relative;display:inline-flex;align-items:center;justify-content:center;
-  width:var(--dsh-panel-entry-size, 32px);height:var(--dsh-panel-entry-size, 32px);padding:0;border:none;border-radius:8px;
-  background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}
-.dsh-pins-panel-entry:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-.dsh-pins-panel-entry.is-active{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-.dsh-pins-panel-count{position:absolute;top:1px;right:1px;min-width:13px;height:13px;padding:0 3px;border-radius:999px;
-  background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);font-size:9px;line-height:13px;text-align:center;
-  font-family:inherit;pointer-events:none}
+/* Left sidebar footer action: a control beside Settings that opens the right column's
+   pin tab. The host decides the row height, so nothing here fixes one. */
+.dsh-pins-entry{position:relative;display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 8px;
+  border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);
+  font:inherit;font-size:12px;font-family:inherit;cursor:pointer;white-space:nowrap}
+.dsh-pins-entry:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.dsh-pins-entry.is-flash{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.dsh-pins-entry-label{overflow:hidden;text-overflow:ellipsis}
+.dsh-pins-entry-count{min-width:15px;height:15px;padding:0 4px;border-radius:999px;background:var(--dsw-alias-brand-primary);
+  color:var(--dsw-alias-bg-base);font-size:10px;line-height:15px;text-align:center}
 `;
       try {
         const element = document.createElement('style');
@@ -3667,44 +3667,65 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     /**
      * The left sidebar's entry to this panel.
      *
-     * The right column can be closed, and then nothing in the UI reaches the pins: the
-     * only openings were pinning something and a six-second pill after a jump. A left
-     * sidebar entry is persistent, sits where every other panel is reached from, and
-     * works even when the right column was closed by hand.
+     * This lives in `sidebar.footer.action` — the slot declared for "actions beside
+     * Settings" — and deliberately *not* in `sidebar.panellist`. That slot is for global
+     * panels: its host renders one button per entry and its click calls
+     * `selectPanel(id)`, so an entry whose id is not a registered *main panel* is a
+     * button that does nothing. This action opens the right column's tab instead, which
+     * keeps the conversation in the main column exactly where it was.
      */
-    function PinnedPanelEntry({ context, active }) {
+    function PinnedPanelEntry({ context, wide }) {
       const [count, setCount] = React.useState(() => totalPins());
-      const [busy, setBusy] = React.useState(false);
+      const [problem, setProblem] = React.useState('');
+      const [flash, setFlash] = React.useState(false);
 
       React.useEffect(() => store.subscribe(() => setCount(totalPins())), []);
 
       const open = () => {
-        setBusy(true);
-        window.setTimeout(() => setBusy(false), 400);
+        setFlash(true);
+        window.setTimeout(() => setFlash(false), 500);
+        let service = null;
         try {
-          context?.get?.('sidebarRight')?.openTab?.(TAB_KIND);
+          service = context?.get?.('sidebarRight') ?? null;
         } catch (error) {
-          console.error('[dsh-pins] 从左栏打开面板失败', error);
+          console.error('[dsh-pins] 取 sidebarRight 失败', error);
+        }
+        if (!service || typeof service.openTab !== 'function') {
+          setProblem('右侧栏服务不可用');
+          console.error('[dsh-pins] 左栏入口：sidebarRight 服务不可用');
+          return;
+        }
+        if (tabTypeStatus.state !== 'ready') {
+          setProblem(`标签类型未注册（${tabTypeStatus.state}）`);
+        }
+        try {
+          service.openTab(TAB_KIND);
+          setProblem('');
+        } catch (error) {
+          const message = String(error?.message ?? error);
+          console.error('[dsh-pins] 左栏入口打开面板失败', error);
+          setProblem(message);
         }
       };
 
+      const label = count > 0 ? `固定片段（${count} 条）` : '固定片段';
       return h(
         'button',
         {
           type: 'button',
-          className: `dsh-pins-panel-entry${active ? ' is-active' : ''}${busy ? ' is-busy' : ''}`,
-          title: count > 0 ? `固定片段（${count} 条）` : '固定片段（还没有）',
+          className: `dsh-pins-entry${flash ? ' is-flash' : ''}`,
+          title: problem === '' ? label : `${label}：${problem}`,
           'aria-label': '固定片段',
-          'aria-pressed': active ? 'true' : 'false',
           onClick: open,
         },
         h(
           'svg',
-          { viewBox: '0 0 24 24', width: 18, height: 18, 'aria-hidden': true, focusable: 'false' },
-          h('rect', { x: 4, y: 4, width: 12, height: 12, rx: 2.5, fill: 'none', stroke: 'currentColor', strokeWidth: 1.6 }),
-          h('rect', { x: 9, y: 9, width: 11, height: 11, rx: 2.5, fill: 'currentColor', fillOpacity: 0.18, stroke: 'currentColor', strokeWidth: 1.6 }),
+          { viewBox: '0 0 24 24', width: 16, height: 16, 'aria-hidden': true, focusable: 'false' },
+          h('rect', { x: 4, y: 4, width: 12, height: 12, rx: 2.5, fill: 'none', stroke: 'currentColor', strokeWidth: 1.7 }),
+          h('rect', { x: 9, y: 9, width: 11, height: 11, rx: 2.5, fill: 'currentColor', fillOpacity: 0.2, stroke: 'currentColor', strokeWidth: 1.7 }),
         ),
-        count > 0 ? h('span', { className: 'dsh-pins-panel-count' }, count > 99 ? '99+' : count) : null,
+        wide ? h('span', { className: 'dsh-pins-entry-label' }, '固定片段') : null,
+        count > 0 ? h('span', { className: 'dsh-pins-entry-count' }, count > 99 ? '99+' : count) : null,
       );
     }
 
@@ -3820,15 +3841,15 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       }
 
       // A persistent way in: the right column can be closed, and then nothing reaches the
-      // pins. The entry sits in the left sidebar's panel row, where every other panel is
-      // opened from, and it is contributed through `slots.inject` so it waits for the
-      // slot to exist rather than assuming load order.
+      // pins. The entry sits beside Settings at the sidebar foot — the slot declared for
+      // exactly this — and is contributed through `slots.inject` so it waits for the slot
+      // to exist rather than assuming load order.
       if (slots && typeof slots.inject === 'function' && typeof slots.register === 'function') {
         try {
           own(
-            slots.inject('sidebar.panellist', () =>
-              slots.register({ name: 'sidebar.panellist', id: PKG, order: 40, label: '固定片段' }, (props) =>
-                h(PinnedPanelEntry, { context, active: props?.active === true }),
+            slots.inject('sidebar.footer.action', () =>
+              slots.register({ name: 'sidebar.footer.action', id: PKG, order: 40, label: '固定片段' }, (props) =>
+                h(PinnedPanelEntry, { context, wide: props?.wide === true }),
               ),
             ),
           );
@@ -3858,6 +3879,22 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           return;
         }
         if (tabs && typeof tabs.register === 'function') {
+          // Ask before claiming. A live edit rematerializes this module and runs `apply`
+          // again while the previous instance's registration is still in the registry, so
+          // registering unconditionally threw `already registered` and the panel announced
+          // a failure that a page refresh then "fixed". An existing registration of our own
+          // kind is success: the tab is usable either way.
+          let held = null;
+          try {
+            held = typeof tabs.get === 'function' ? (tabs.get(TAB_KIND) ?? null) : null;
+          } catch {
+            held = null;
+          }
+          if (held) {
+            tabTypeStatus.state = 'ready';
+            tabTypeStatus.detail = '';
+            return;
+          }
           try {
             own(
               tabs.register({
@@ -3873,9 +3910,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             tabTypeStatus.state = 'ready';
             tabTypeStatus.detail = '';
           } catch (error) {
+            const message = String(error?.message ?? error);
+            // A collision on our own id means an earlier instance holds it and the kind is
+            // therefore registered; that is a working panel, not a failure.
+            if (/already registered|already taken|duplicate/i.test(message)) {
+              console.warn('[dsh-pins] 标签类型已由先前实例注册，沿用现有注册', message);
+              tabTypeStatus.state = 'ready';
+              tabTypeStatus.detail = '';
+              return;
+            }
             console.error('[dsh-pins] tab type registration failed', error);
             tabTypeStatus.state = 'failed';
-            tabTypeStatus.detail = String(error?.message ?? error);
+            tabTypeStatus.detail = message;
           }
           return;
         }
