@@ -34,7 +34,6 @@ window.__ModuleLoader__.load({
     const STATE_KEY = 'dsh-pins/v1';
     const MODE_KEY = 'dsh-pins/mode';
     const MAX_CHARS = 600;
-    const QUOTE_CONTEXT = 24;
     const TOOLBAR_HEIGHT = 40;
     const TOOLBAR_WIDTH = 220;
     /** How far from the recorded offset a re-located passage may sit, in characters. */
@@ -108,6 +107,10 @@ window.__ModuleLoader__.load({
      * and will recognise.
      */
     function sessionLabel(entry) {
+      // The live projection is preferred, the cached title second: the cache is only
+      // written when a pin is added, so a rename would otherwise be lost for a Session
+      // whose title was read after its last pin.
+      if (typeof entry?.liveTitle === 'string' && entry.liveTitle.trim() !== '') return entry.liveTitle.trim();
       if (typeof entry?.title === 'string' && entry.title.trim() !== '') return entry.title.trim();
       const pins = entry?.pins ?? [];
       let newest = null;
@@ -122,11 +125,11 @@ window.__ModuleLoader__.load({
     /**
      * Read one Session's title through the Client session service.
      *
-     * Three levels are probed, most direct first, because these method names may
-     * move between Harness releases: the projection value, the session list row,
-     * then the Session instance's own snapshot. Absence is not an error: a Session
-     * with no title yet simply reports an empty string, and callers fall back to
-     * the newest pin's text.
+     * Levels are probed most-direct first, because these shapes move between Harness
+     * releases: the live Session's projection face, the session list row, the Session
+     * snapshot, then the row's `projectionValues` block. Absence is not an error: a
+     * Session with no title yet reports an empty string, and callers fall back to the
+     * newest pin's text.
      *
      * @returns the title, or an empty string when none is available.
      */
@@ -141,25 +144,34 @@ window.__ModuleLoader__.load({
       if (!sessions) return '';
 
       const clean = (value) => (typeof value === 'string' ? value.trim() : '');
-      try {
-        const projection = sessions.projectionValues?.(sessionId);
-        const fromProjection = clean(projection?.title);
-        if (fromProjection !== '') return fromProjection;
-      } catch {
-        /* fall through to the next level */
-      }
-      try {
-        const row = sessions.list?.getSnapshot?.()?.byId?.[sessionId];
-        const fromRow = clean(row?.title);
-        if (fromRow !== '') return fromRow;
-      } catch {
-        /* fall through to the next level */
-      }
-      try {
-        const fromBinding = clean(sessions.binding?.(sessionId)?.session?.getSnapshot?.()?.title);
-        if (fromBinding !== '') return fromBinding;
-      } catch {
-        /* no title available */
+      const row = (() => {
+        try {
+          return sessions.list?.getSnapshot?.()?.byId?.[sessionId] ?? null;
+        } catch {
+          return null;
+        }
+      })();
+      const binding = (() => {
+        try {
+          return sessions.binding?.(sessionId) ?? null;
+        } catch {
+          return null;
+        }
+      })();
+
+      const attempts = [
+        () => binding?.session?.projections?.faceOf?.('title')?.getSnapshot?.(),
+        () => row?.projectionValues?.title,
+        () => row?.title,
+        () => binding?.session?.getSnapshot?.()?.title,
+      ];
+      for (const attempt of attempts) {
+        try {
+          const value = clean(attempt());
+          if (value !== '') return value;
+        } catch {
+          /* try the next shape */
+        }
       }
       return '';
     }
@@ -242,10 +254,23 @@ window.__ModuleLoader__.load({
     function createStore() {
       let data = normalizeData(readJson(STATE_KEY, null));
       const listeners = new Set();
+      /**
+       * Why the last persistence attempt failed, or `''` when it succeeded.
+       *
+       * A full storage quota used to be completely silent: the UI reported "已固定 1
+       * 条", the record existed in memory, and a refresh wiped it without a single
+       * console line. The panel reads this and keeps a warning on screen until a
+       * write succeeds again.
+       *
+       * `persistOk` starts true because nothing has failed yet. Starting it false made
+       * a freshly loaded page announce "your work is not being saved" before the user
+       * had done anything at all — and an alarm that fires when nothing is wrong is
+       * worse than no alarm, because the real one stops being believed.
+       */
+      let persistError = '';
+      let persistOk = true;
 
-      const commit = () => {
-        writeJson(STATE_KEY, data);
-        writeJson(MODE_KEY, data.mode);
+      const notify = () => {
         for (const listener of [...listeners]) {
           try {
             listener();
@@ -253,6 +278,54 @@ window.__ModuleLoader__.load({
             console.error('[dsh-pins] subscriber failed', error);
           }
         }
+      };
+
+      /** Rough usage of this origin's whole storage pool, for the quota message. */
+      const usageNote = () => {
+        try {
+          const store = globalThis.localStorage;
+          if (!store) return '';
+          let bytes = 0;
+          for (let at = 0; at < store.length; at += 1) {
+            const key = store.key(at) ?? '';
+            bytes += (key.length + (store.getItem(key) ?? '').length) * 2; // UTF-16
+          }
+          return `（这个站点当前已用约 ${(bytes / 1024 / 1024).toFixed(2)} MB）`;
+        } catch {
+          return '';
+        }
+      };
+
+      const describeFailure = (error) => {
+        const name = String(error?.name ?? '');
+        if (name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED') {
+          return `浏览器存储已满${usageNote()}：这次改动没有保存。删掉一些不再需要的固定片段，或清掉别的插件缓存后就会恢复。`;
+        }
+        if (globalThis.localStorage === undefined) {
+          return '这个页面不允许访问本地存储：改动只存在于内存里，刷新就会丢。';
+        }
+        return `保存失败（${name || String(error ?? '未知原因')}）：改动没有写入本地存储。`;
+      };
+
+      /**
+       * Write the whole state, then tell subscribers what happened.
+       *
+       * @returns whether both keys were written.
+       */
+      const commit = () => {
+        let failure = '';
+        try {
+          if (globalThis.localStorage === undefined) throw new Error('localStorage unavailable');
+          globalThis.localStorage.setItem(STATE_KEY, JSON.stringify(data));
+          globalThis.localStorage.setItem(MODE_KEY, JSON.stringify(data.mode));
+        } catch (error) {
+          failure = describeFailure(error);
+          console.error('[dsh-pins] 保存固定片段失败', error);
+        }
+        persistError = failure;
+        persistOk = failure === '';
+        notify();
+        return persistOk;
       };
 
       const sessionOf = (sessionId, create) => {
@@ -280,12 +353,23 @@ window.__ModuleLoader__.load({
           listeners.add(listener);
           return () => listeners.delete(listener);
         },
+        /**
+         * Whether the last write reached local storage.
+         *
+         * The panel shows a standing warning whenever this is false; a mutation that
+         * failed silently is worse than one that failed loudly.
+         */
+        storageStatus() {
+          return { ok: persistOk && persistError === '', error: persistError };
+        },
+        /** Whether the most recent mutating call reached local storage. */
+        lastPersisted: true,
         getMode() {
           return data.mode === 'all' ? 'all' : 'session';
         },
         setMode(mode) {
           data.mode = mode === 'all' ? 'all' : 'session';
-          commit();
+          api.lastPersisted = commit();
         },
         /** Pins of one Session in display order: the Session's own order, else source order. */
         list(sessionId) {
@@ -304,7 +388,16 @@ window.__ModuleLoader__.load({
             for (const pin of entry.pins) if (byId.has(pin.id)) ordered.push(pin);
             return ordered;
           }
-          return [...entry.pins].sort((a, b) => (a.anchor?.seq ?? 0) - (b.anchor?.seq ?? 0));
+          // Source order, by Turn. `seq` is not the primary key: it was hardcoded 0
+          // for a long time, so existing pins carry none, while `turn` was always
+          // captured from the row and is what the conversation itself is ordered by.
+          return [...entry.pins].sort((a, b) => {
+            const turnDelta = (a.anchor?.turn ?? 0) - (b.anchor?.turn ?? 0);
+            if (turnDelta !== 0) return turnDelta;
+            const seqDelta = (a.anchor?.seq ?? 0) - (b.anchor?.seq ?? 0);
+            if (seqDelta !== 0) return seqDelta;
+            return (a.pinnedAt ?? 0) - (b.pinnedAt ?? 0);
+          });
         },
         count(sessionId) {
           return sessionOf(sessionId, false)?.pins.length ?? 0;
@@ -353,7 +446,7 @@ window.__ModuleLoader__.load({
           }
           if (touched > 0) {
             entry.updatedAt = Date.now();
-            commit();
+            api.lastPersisted = commit();
           }
           return touched;
         },
@@ -388,7 +481,7 @@ window.__ModuleLoader__.load({
               existing.anchor = { ...existing.anchor, ...pin.anchor };
               if (typeof pin.text === 'string' && pin.text !== '') existing.text = pin.text;
               entry.updatedAt = Date.now();
-              commit();
+              api.lastPersisted = commit();
             }
             return existing;
           }
@@ -402,7 +495,9 @@ window.__ModuleLoader__.load({
           };
           entry.pins = [...entry.pins, record];
           touch(sessionId, title);
-          commit();
+          // Told to the caller, never written into the record: whether this write
+          // reached storage is a fact about this moment, not about the pin.
+          api.lastPersisted = commit();
           return record;
         },
         remove(sessionId, id) {
@@ -412,7 +507,7 @@ window.__ModuleLoader__.load({
           if (Array.isArray(entry.order)) entry.order = entry.order.filter((each) => each !== id);
           entry.updatedAt = Date.now();
           if (entry.pins.length === 0) delete data.sessions[String(sessionId)];
-          commit();
+          api.lastPersisted = commit();
         },
         /**
          * Add a tag to one pin.
@@ -432,7 +527,7 @@ window.__ModuleLoader__.load({
           pin.tags = [...current, tag];
           const entry = sessionOf(sessionId, true);
           entry.updatedAt = Date.now();
-          commit();
+          api.lastPersisted = commit();
           return true;
         },
         /** Remove one tag from one pin. @returns whether anything changed. */
@@ -444,7 +539,7 @@ window.__ModuleLoader__.load({
           pin.tags = current.filter((each) => each !== tag);
           const entry = sessionOf(sessionId, true);
           entry.updatedAt = Date.now();
-          commit();
+          api.lastPersisted = commit();
           return true;
         },
       };
@@ -539,9 +634,12 @@ window.__ModuleLoader__.load({
       if (!sourceKey || sourceKey !== targetKey) return { ok: false, reason: 'multi' };
 
       const truncated = text.length > MAX_CHARS;
-      const quote = truncated ? text.slice(0, MAX_CHARS) : text;
-      // The raw form is cut at the same place, so the two stay the same passage.
-      const rawQuote = truncated ? rawText.slice(0, Math.max(MAX_CHARS, quote.length)) : rawText;
+      // Cut the raw selection first and normalize the cut, so the display text and the
+      // locator quote always describe the same characters. Slicing each in its own
+      // character space made the display form shorter than "the first MAX_CHARS" on
+      // whitespace-dense selections, and left the two pointing at different passages.
+      const rawQuote = truncated ? rawText.slice(0, MAX_CHARS) : rawText;
+      const quote = truncated ? rawQuote.replace(/\s+/g, ' ') : text;
 
       let offset = -1;
       let rawOffset = -1;
@@ -559,6 +657,18 @@ window.__ModuleLoader__.load({
 
       const singleBlock = blockKindOf(startElement) === blockKindOf(endElement) ? blockKindOf(startElement) : 'prose';
 
+      // Whether the selection is only part of its block: a fact only observable at
+      // pin time, and the one the renderer needs to say "this is a fragment".
+      const partial = (() => {
+        try {
+          const block = startElement.closest('pre, p, li, blockquote, table, h1, h2, h3, h4, h5, h6') ?? startElement;
+          const whole = String(block.textContent ?? '').replace(/\s+/g, ' ').trim();
+          return whole !== '' && whole !== text.trim();
+        } catch {
+          return false;
+        }
+      })();
+
       return {
         ok: true,
         anchor: {
@@ -567,7 +677,10 @@ window.__ModuleLoader__.load({
           node: source.getAttribute('data-chat-node-key') ?? sourceKey,
           kind: source.getAttribute('data-chat-flow-kind') ?? '',
           turn: Number(source.getAttribute('data-chat-turn') ?? 0) || 0,
-          seq: 0,
+          // `seq` is left out on purpose: the row does not carry it, and the value
+          // has to be resolved from the turn outline when a jump needs to page
+          // history. Writing a placeholder here is what made "source order" and
+          // "jump to unloaded history" silently wrong.
           offset,
           rawOffset,
           rawLength: rawQuote.length,
@@ -575,9 +688,7 @@ window.__ModuleLoader__.load({
           rawQuote,
           block: singleBlock,
           lang: singleBlock === 'code' ? codeLanguageOf(startElement) : '',
-          partial: false,
-          prefix: text.slice(0, QUOTE_CONTEXT),
-          suffix: text.slice(-QUOTE_CONTEXT),
+          partial,
         },
         text: rawQuote,
         truncated,
@@ -1037,6 +1148,26 @@ window.__ModuleLoader__.load({
     function startMarkerWatch() {
       try {
         markerState.observer = new MutationObserver((records) => {
+          // Our own `<mark>` wrappers are mutations too. Without this pass they would
+          // be read as document changes, schedule another pass, and that pass would
+          // unwrap and re-wrap — a self-sustaining loop measured at hundreds of DOM
+          // changes per second in browsers without the Custom Highlight API.
+          let foreign = false;
+          for (const record of records) {
+            if (record.target?.nodeType === 1 && record.target.hasAttribute?.('data-dsh-pins-mark')) continue;
+            const added = record.addedNodes ?? [];
+            const removed = record.removedNodes ?? [];
+            const onlyOurs =
+              [...added, ...removed].length > 0 &&
+              [...added, ...removed].every(
+                (node) => node.nodeType === 1 && node.hasAttribute?.('data-dsh-pins-mark'),
+              );
+            if (onlyOurs) continue;
+            foreign = true;
+            break;
+          }
+          if (!foreign) return;
+
           // Only an edit that touches a row we indexed can invalidate anything.
           // React re-renders the frame constantly (composer state, streaming
           // tokens, scroll affordances), and treating all of it as a change made
@@ -1197,15 +1328,52 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Ask the Session to page history back through one sequence number, then give
-     * the Conversation a moment to mount the row.
+     * How the panel hands the turn-outline projection to the frame-wide code.
+     *
+     * Paging history needs the `turn/start` seq of the turn a pin lives in, and that
+     * mapping only exists as the `turnOutline` projection — which reaches the panel
+     * through the slot standard kit (`useProjection`), not through the Cordis
+     * context the overlay half holds. The panel registers a resolver here, so a jump
+     * started anywhere can page history for a turn number.
+     */
+    let turnSeqProvider = null;
+
+    function setTurnSeqProvider(provider) {
+      turnSeqProvider = provider;
+    }
+
+    /**
+     * The `turn/start` seq of one pin's turn, when it can be determined.
+     *
+     * Preference order: what the pin recorded at pin time, then the live projection.
+     * A pin from before this existed has no seq, and a projection may legitimately
+     * lack the turn (history not loaded), in which case the caller reports that
+     * paging is unavailable instead of jumping somewhere wrong.
+     */
+    function resolveTurnSeq(pin) {
+      const stored = pin?.anchor?.turnSeq;
+      if (Number.isFinite(stored) && stored > 0) return stored;
+      const turn = pin?.anchor?.turn;
+      const sessionId = pin?.anchor?.sessionId;
+      if (!Number.isFinite(turn) || turn <= 0 || !sessionId || typeof turnSeqProvider !== 'function') return 0;
+      try {
+        return turnSeqProvider(sessionId, turn);
+      } catch (error) {
+        console.error('[dsh-pins] 查询轮次 seq 失败', error);
+        return 0;
+      }
+    }
+
+    /**
+     * Ask the Session to page history back through the turn a pin lives in, then
+     * give the Conversation a moment to mount the row.
      *
      * Best-effort by design: the jump API that would await this is not exported to
      * plugins, so a message outside the loaded window may still need one manual
      * scroll upward. The caller reports that outcome instead of pinning a guess.
      */
     function pageHistoryFor(pin, context) {
-      const seq = pin?.anchor?.seq;
+      const seq = resolveTurnSeq(pin);
       const sessionId = pin?.anchor?.sessionId;
       if (!Number.isFinite(seq) || seq <= 0 || !sessionId) return Promise.resolve(false);
       try {
@@ -1313,7 +1481,11 @@ window.__ModuleLoader__.load({
   border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;cursor:pointer}
 .dsh-pins-root .search .clear:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .dsh-pins-root .count{font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}
-.dsh-pins-root .scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:8px}
+/* A query container so the expanded cap can be a share of the LIST viewport rather
+   than of the window: the right column is often shorter than the window, and viewport
+   units would then allow a card taller than the list itself. */
+.dsh-pins-root .scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:8px;
+  container-type:size}
 .dsh-pins-root .group{margin:0 0 2px;padding:6px 6px 2px;font-size:11px;color:var(--dsw-alias-label-tertiary);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsh-pins-root .group span{color:var(--dsw-alias-label-secondary);font-weight:600}
@@ -1329,6 +1501,17 @@ window.__ModuleLoader__.load({
 .dsh-pins-card .txt{white-space:pre-wrap;overflow-wrap:anywhere;overflow:hidden;
   max-height:calc(3 * (17px + var(--dsh-content-font-delta, 0px)));
   font-size:12px;line-height:calc(17px + var(--dsh-content-font-delta, 0px))}
+/* Expanded: the card is the height owner, the text becomes the scrolling window. */
+.dsh-pins-card[data-open]{display:flex;flex-direction:column;max-height:min(60cqh, 420px)}
+.dsh-pins-card[data-open] .txt{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+  max-height:none;cursor:text;
+  /* The gutter that keeps the wheel on the list belongs to the CARD, so it is a margin
+     here and never padding on the scroller: padding would belong to the scroller and
+     the wheel over it would keep scrolling the text. */
+  margin-right:16px}
+.dsh-pins-card[data-open] .txt.is-open{max-height:none}
+.dsh-pins-card[data-open] .tagrow,.dsh-pins-card[data-open] .tags,.dsh-pins-card[data-open] .meta{flex:none}
+@media (prefers-reduced-motion:reduce){.dsh-pins-card,.dsh-pins-card .txt{transition:none}}
 /* Code keeps its own layout: no collapsing of indentation, monospace metrics. */
 .dsh-pins-card .txt-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   font-size:11.5px;line-height:calc(16px + var(--dsh-content-font-delta, 0px));
@@ -1394,6 +1577,9 @@ window.__ModuleLoader__.load({
 .dsh-pins-root .tagrow-chips .tag{border:none;font-family:inherit}
 .dsh-pins-card .ops{position:absolute;top:5px;right:5px;display:none;gap:2px}
 .dsh-pins-card:hover .ops,.dsh-pins-card:focus-within .ops{display:flex}
+/* An expanded card keeps its controls in place: the passage below it is a jump target,
+   so the editor's own entry point must not depend on the pointer staying over the card. */
+.dsh-pins-card[data-open] .ops{display:flex}
 .dsh-pins-card .ops button{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;
   border:none;border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);
   font:inherit;font-size:12px;cursor:pointer}
@@ -1406,6 +1592,8 @@ window.__ModuleLoader__.load({
 .dsh-pins-root .empty kbd{padding:1px 5px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;
   background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px}
 .dsh-pins-root .note{margin:0;color:var(--dsw-alias-state-warn-primary);font-size:11px;line-height:1.6}
+.dsh-pins-root .storage-warn{padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:7px;
+  background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:1.6}
 .dsh-pins-note{position:fixed;left:50%;bottom:72px;transform:translateX(-50%);z-index:30;padding:6px 12px;
   border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-overlay);
   color:var(--dsw-alias-label-secondary);font-size:12px;font-family:inherit;pointer-events:none}
@@ -1703,6 +1891,11 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               say(`已经有 #${action.tag} 这个标签了`);
               return;
             }
+            if (store.lastPersisted === false) {
+              const status = store.storageStatus();
+              say(status.error || '保存失败：这条没有写入本地存储');
+              return;
+            }
             const count = store.count(target);
             const panelProblem = showPanel();
             say(panelProblem !== '' ? `已固定 ${count} 条 · ${panelProblem}` : `已固定 ${count} 条（原文已加标记）`);
@@ -1981,9 +2174,41 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#region sidebar panel
 
-    function PinCard({ sessionId, pin, current, taggable, onTagChange, context }) {
-      const [editing, setEditing] = React.useState(false);
+    /**
+     * One pinned passage.
+     *
+     * Three states, and which click does what depends on them:
+     *
+     * - `idle` (three lines): clicking anywhere jumps back to the source, which keeps
+     *   the muscle memory of the previous version.
+     * - `preview` (expanded, scrollable): clicking toggles the tag editor, because
+     *   inside an expanded card the useful next action is editing rather than leaving.
+     * - `manage` (editor visible): sticky — moving the pointer away must not take the
+     *   input out from under the user, so only leaving the card or pressing Esc ends it.
+     *
+     * The expanded body keeps a right gutter that belongs to the card rather than to
+     * the inner scroller, so the wheel still scrolls the list when the pointer is over
+     * that strip. `padding` would not do this: padding belongs to the scroller, so the
+     * wheel would keep scrolling the text.
+     */
+    function PinCard({ sessionId, pin, current, taggable, onTagChange, context, cardState }) {
       const [draft, setDraft] = React.useState('');
+      const rootRef = React.useRef(null);
+      const open = cardState?.isOpen?.(pin.id) === true;
+      const managing = cardState?.isManaging?.(pin.id) === true;
+
+      React.useLayoutEffect(() => {
+        // An expanded card near the bottom of the list would otherwise grow past the
+        // viewport. Scrolling the list by exactly the overflow is instant on purpose:
+        // a smooth scroll while the pointer rests on the card moves the card away from
+        // the cursor and starts an open/close oscillation.
+        if (!open) return;
+        const root = rootRef.current;
+        const scroller = root?.closest('.dsh-pins-root .scroll');
+        if (!root || !scroller) return;
+        const overflow = root.getBoundingClientRect().bottom - scroller.getBoundingClientRect().bottom;
+        if (overflow > 0) scroller.scrollTop += overflow;
+      }, [open]);
 
       const submit = () => {
         const tag = normalizeTag(draft);
@@ -1994,7 +2219,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         if (added === false) announce(`已经有 #${tag} 这个标签了`);
       };
 
-      const open = () => {
+      const jump = () => {
         let verdict = 'missing';
         try {
           verdict = jumpToPin(pin, context);
@@ -2010,6 +2235,41 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         PINS_EVENTS.dispatchEvent(new Event('jump'));
       };
 
+      /**
+       * The card's click surface.
+       *
+       * Clicking the passage always jumps back to the source. Toggling the tag editor
+       * on a click anywhere was wrong in practice: the card expands on hover, so a
+       * click almost never lands in the collapsed state the old rule assumed, and the
+       * primary action — go to the source — became unreachable. The editor now has its
+       * own controls (the `#` button, and the card's chrome around the passage), and
+       * the passage keeps the one meaning it has everywhere else.
+       */
+      const onCardClick = (event) => {
+        if (event.target.closest?.('.tagrow, .tagmgr, .ops, .tagrow-chips')) return;
+        if (event.target.closest?.('.txt')) {
+          jump();
+          return;
+        }
+        if (open || managing) cardState?.toggleManage?.(pin.id);
+        else jump();
+      };
+
+      const onKeyDown = (event) => {
+        if (event.key === 'Escape') {
+          if (managing) {
+            event.preventDefault();
+            cardState?.toggleManage?.(pin.id);
+          }
+          return;
+        }
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          if (event.target?.closest?.('.txt') || !open) jump();
+          else cardState?.toggleManage?.(pin.id);
+        }
+      };
+
       const ops = [
         taggable
           ? h(
@@ -2017,10 +2277,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               {
                 key: 'tag',
                 type: 'button',
-                title: '加标签',
+                title: managing ? '收起标签编辑' : '加标签 / 编辑标签',
                 onClick: (event) => {
                   event.stopPropagation();
-                  setEditing((value) => !value);
+                  cardState?.toggleManage?.(pin.id);
                 },
               },
               '#',
@@ -2066,6 +2326,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       return h(
         'div',
         {
+          ref: rootRef,
           'data-dsh-pins': '',
           className: 'dsh-pins-card',
           'data-kind': pin.anchor?.kind ?? '',
@@ -2073,17 +2334,16 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           'data-truncated': pin.anchor?.partial === true || fullText.length > 600 ? '' : undefined,
           'data-lines': cardLines(fullText),
           'data-current': current ? '' : undefined,
+          'data-open': open ? '' : undefined,
+          'data-managing': managing ? '' : undefined,
           role: 'button',
           tabIndex: 0,
-          title: fullText,
+          // No `title`: the native tooltip would pop over the expanded body and fight it.
           ...CARD_GUARD,
-          onClick: open,
-          onKeyDown: (event) => {
-            if (event.key === 'Enter' || event.key === ' ') {
-              event.preventDefault();
-              open();
-            }
-          },
+          onMouseEnter: () => cardState?.requestOpen?.(pin.id),
+          onMouseLeave: () => cardState?.requestClose?.(pin.id),
+          onClick: onCardClick,
+          onKeyDown,
         },
         h(
           'div',
@@ -2098,7 +2358,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             : null,
           h('span', { style: { marginLeft: 'auto' } }, relTime(pin.pinnedAt)),
         ),
-        h('div', { className: bodyClass }, fullText),
+        h('div', { className: `${bodyClass}${open ? ' is-open' : ''}` }, fullText),
         Array.isArray(pin.tags) && pin.tags.length > 0
           ? h(
               'div',
@@ -2119,17 +2379,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               ),
             )
           : null,
-        editing
+        managing
           ? h(
               'div',
               {
                 className: 'tagrow',
                 onClick: (event) => event.stopPropagation(),
-                // The editor closes when focus leaves the card, which `CARD_GUARD`
-                // keeps from firing for clicks inside it.
-                onBlur: (event) => {
-                  if (!event.currentTarget.contains(event.relatedTarget)) setEditing(false);
-                },
               },
               (pin.tags ?? []).length > 0
                 ? h(
@@ -2173,7 +2428,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                     submit();
                   } else if (event.key === 'Escape') {
                     event.preventDefault();
-                    setEditing(false);
+                    setDraft('');
+                    cardState?.toggleManage?.(pin.id);
                   }
                 },
               }),
@@ -2192,11 +2448,28 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     }
 
     /**
-     * Build the panel component for one plugin context.
+     * Hover-intent timings, in ms.
+     *
+     * The list is dense (cards are ~6px apart), so entering on pointer-over fires
+     * while the pointer merely crosses a card on its way somewhere else. A short
+     * dwell to open and a longer grace to close is what keeps a diagonal mouse move
+     * from cascading through the list.
+     */
+    const HOVER_OPEN_DELAY = 120;
+    const HOVER_CLOSE_DELAY = 160;
+    /** After the list scrolls, hover is inert briefly: otherwise cards open and close under a resting pointer. */
+    const HOVER_SCROLL_QUIET = 150;
+
+    /**
+     * Build the pin list.
+     *
+     * The hover behaviour lives here rather than in each card because "one expanded
+     * card at a time" is a property of the list: the card that opens asks this owner
+     * to open, and the owner closes whatever was open before.
      *
      * The context is closed over rather than read from props: the Sidebar's tab
-     * body receives session-standard props only, and jumping back needs the
-     * Session controller to page history when the target is not mounted yet.
+     * body receives session-standard props only, and jumping back needs the Session
+     * controller to page history when the target is not mounted yet.
      */
     function createPinsPanel(context) {
       return function PinsPanel(props) {
@@ -2207,6 +2480,101 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const [query, setQuery] = React.useState('');
       const [tagFilter, setTagFilter] = React.useState(() => new Set());
       const [notice, setNotice] = React.useState('');
+
+      // Which card is expanded, and which expanded card is in its tag editor. Two
+      // ids rather than one "state" so the editor survives a re-render of the list.
+      const [openId, setOpenId] = React.useState(null);
+      const [manageId, setManageId] = React.useState(null);
+      const [hoverInert, setHoverInert] = React.useState(false);
+      const hovers = React.useRef({ open: null, close: null });
+
+      const clearHoverTimers = React.useCallback(() => {
+        if (hovers.current.open !== null) window.clearTimeout(hovers.current.open);
+        if (hovers.current.close !== null) window.clearTimeout(hovers.current.close);
+        hovers.current.open = null;
+        hovers.current.close = null;
+      }, []);
+
+      const closeExpanded = React.useCallback(() => {
+        clearHoverTimers();
+        setOpenId(null);
+        setManageId(null);
+      }, [clearHoverTimers]);
+
+      const cardState = React.useMemo(
+        () => ({
+          isOpen: (id) => openId === id,
+          isManaging: (id) => manageId === id,
+          /**
+           * A card asks to open on hover. Refused while another card is being edited:
+           * taking the editor away because the pointer travelled across the list is
+           * exactly the failure the sticky rule exists to prevent.
+           */
+          requestOpen: (id) => {
+            if (hoverInert || manageId !== null) return;
+            if (hovers.current.close !== null) {
+              window.clearTimeout(hovers.current.close);
+              hovers.current.close = null;
+            }
+            if (openId === id || hovers.current.open !== null) return;
+            hovers.current.open = window.setTimeout(() => {
+              hovers.current.open = null;
+              setOpenId(id);
+            }, HOVER_OPEN_DELAY);
+          },
+          requestClose: (id) => {
+            if (manageId === id) return;
+            if (hovers.current.open !== null) {
+              window.clearTimeout(hovers.current.open);
+              hovers.current.open = null;
+            }
+            if (openId !== id || hovers.current.close !== null) return;
+            hovers.current.close = window.setTimeout(() => {
+              hovers.current.close = null;
+              setOpenId((current) => (current === id ? null : current));
+            }, HOVER_CLOSE_DELAY);
+          },
+          /** Click inside an expanded card alternates between reading and editing. */
+          toggleManage: (id) => {
+            clearHoverTimers();
+            setOpenId(id);
+            setManageId((current) => (current === id ? null : id));
+          },
+          /** Put the whole list back to its collapsed state; `Esc` and panel-level affordances use it. */
+          collapseAll: () => {
+            clearHoverTimers();
+            setOpenId(null);
+            setManageId(null);
+          },
+          manage: (id) => {
+            clearHoverTimers();
+            setOpenId(id);
+            setManageId(id);
+          },
+          scrollQuiet: () => {
+            clearHoverTimers();
+            setHoverInert(true);
+            window.setTimeout(() => setHoverInert(false), HOVER_SCROLL_QUIET);
+          },
+        }),
+        [openId, manageId, hoverInert, clearHoverTimers],
+      );
+
+      React.useEffect(() => clearHoverTimers, [clearHoverTimers]);
+
+      // The turn outline is how a jump pages history to a turn that is not loaded:
+      // it carries each turn's `turn/start` seq. It arrives through the slot standard
+      // kit, so it is published for the frame-wide jump code to use.
+      const projection = typeof props?.useProjection === 'function' ? props.useProjection : null;
+      const turnOutline = projection ? projection('turnOutline') : undefined;
+      React.useEffect(() => {
+        setTurnSeqProvider((id, turn) => {
+          if (id !== sessionId || !Array.isArray(turnOutline)) return 0;
+          const entry = turnOutline.find((row) => row?.turn === turn);
+          return Number.isFinite(entry?.seq) && entry.seq > 0 ? entry.seq : 0;
+        });
+        return () => setTurnSeqProvider(null);
+      }, [sessionId, turnOutline]);
 
       const toggleTagFilter = React.useCallback((tag) => {
         setTagFilter((current) => {
@@ -2301,9 +2669,15 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         store.setMode(next);
       };
 
+      // A failed write leaves the panel saying so until a write succeeds: state in
+      // memory looks perfectly healthy, so silence here is the difference between a
+      // user noticing and a user losing a session's worth of pins on refresh.
+      const storage = store.storageStatus();
+
       const header = h(
         'div',
         { className: 'hd' },
+        storage.ok === false ? h('div', { className: 'storage-warn' }, storage.error) : null,
         h(
           'div',
           { className: 'tabs' },
@@ -2419,12 +2793,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               )
             : h(
                 'div',
-                { className: 'scroll' },
+                { className: 'scroll', onScroll: () => cardState.scrollQuiet() },
                 overview.map(([id, entry, pins]) =>
                   h(
                     'div',
                     { key: id },
-                    h('div', { className: 'group' }, h('span', null, sessionLabel({ ...entry, title: readSessionTitle(context, id) })), ` · ${pins.length}`),
+                    h('div', { className: 'group' }, h('span', null, sessionLabel({ ...entry, liveTitle: readSessionTitle(context, id) })), ` · ${pins.length}`),
                     pins.map((pin) =>
                       h(PinCard, {
                         key: pin.id,
@@ -2432,6 +2806,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                         pin,
                         current: isCurrent && id === sessionId,
                         taggable: false,
+                        cardState,
                         // The overview is for reading; a card there does not edit tags,
                         // and the panel-level manager above it is how one is removed.
                         onTagChange: () => false,
@@ -2461,7 +2836,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       } else {
         body = h(
           'div',
-          { className: 'scroll' },
+          { className: 'scroll', onScroll: () => cardState.scrollQuiet() },
           visible.map((pin) =>
             h(PinCard, {
               key: pin.id,
@@ -2469,6 +2844,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               pin,
               current: false,
               taggable: true,
+              cardState,
               onTagChange: (action, tag) => {
                 if (action === 'add') {
                   const added = store.addTag(sessionId, pin.id, tag);
@@ -2570,8 +2946,21 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           );
           own(
             slots.inject('sidebar.right.pane.tab.title', () =>
-              slots.register({ name: 'sidebar.right.pane.tab.title', key: TAB_ID }, (props) =>
-                props?.sessionId ? `固定片段 · ${store.count(props.sessionId)}` : '固定片段',
+              slots.register(
+                { name: 'sidebar.right.pane.tab.title', key: TAB_ID },
+                // A component, not a string: the count has to follow the store, or the
+                // chip keeps showing a number that the panel below has already refuted.
+                function PinsTabTitle(props) {
+                  const [count, setCount] = React.useState(() =>
+                    props?.sessionId ? store.count(props.sessionId) : 0,
+                  );
+                  React.useEffect(() => {
+                    const sync = () => setCount(props?.sessionId ? store.count(props.sessionId) : 0);
+                    sync();
+                    return store.subscribe(sync);
+                  }, [props?.sessionId]);
+                  return count > 0 ? `固定片段 · ${count}` : '固定片段';
+                },
               ),
             ),
           );
@@ -2604,7 +2993,17 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         }
         if (tabs && typeof tabs.register === 'function') {
           try {
-            own(tabs.register({ id: TAB_ID, kind: TAB_KIND, title: () => '固定片段' }));
+            own(
+              tabs.register({
+                id: TAB_ID,
+                kind: TAB_KIND,
+                title: () => '固定片段',
+                // Keep the panel mounted when the user switches to the file tree and
+                // back: the search term, the tag filter and the scroll position are
+                // view state worth more than the memory the body costs.
+                keepMounted: true,
+              }),
+            );
           } catch (error) {
             console.error('[dsh-pins] tab type registration failed', error);
           }
