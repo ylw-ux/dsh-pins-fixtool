@@ -44,6 +44,73 @@ window.__ModuleLoader__.load({
     /** Cross-component signals inside the plugin (jump happened, filter requested, notice). */
     const PINS_EVENTS = new EventTarget();
 
+    /**
+     * The order the list is shown in.
+     *
+     * Two families, each with both directions:
+     *
+     * - `time` — when the passage was pinned. Fine for "what did I just mark".
+     * - `context` — where the passage sits in the conversation (turn, then position
+     *   inside the message, then the offset within it). This is the "outline" reading
+     *   order, and it needs no insertion rule: a new pin simply lands where its source
+     *   text already is.
+     *
+     * A manual order is deliberately not offered yet; it is the one mode that needs
+     * rules for insertion, for returning to an automatic order, and for coexisting with
+     * the hover expansion, and it would fight the "context order" idea it sits beside.
+     */
+    const SORT_MODES = ['context-asc', 'context-desc', 'time-desc', 'time-asc'];
+    const SORT_LABELS = {
+      'context-asc': '原文 ↑',
+      'context-desc': '原文 ↓',
+      'time-desc': '时间 ↓',
+      'time-asc': '时间 ↑',
+    };
+    const SORT_TITLES = {
+      'context-asc': '按原文顺序（从前往后）——新固定会自动落到它在对话里的位置',
+      'context-desc': '按原文顺序（从后往前）',
+      'time-desc': '按固定时间（新的在前）',
+      'time-asc': '按固定时间（旧的在前）',
+    };
+
+    function normalizeSort(value) {
+      return SORT_MODES.includes(value) ? value : 'context-asc';
+    }
+
+    /**
+     * Order one Session's pins.
+     *
+     * The context comparison is total on purpose: turn, then the position inside the
+     * message, then the offset within the message, then a stable tie-break. Pins made
+     * before part of that existed simply compare equal on the missing part and fall
+     * through to the next key, so no pin is ever dropped or reordered at random.
+     */
+    function sortPins(pins, sort) {
+      const mode = normalizeSort(sort);
+      const byContext = (a, b) => {
+        const turnDelta = (a.anchor?.turn ?? 0) - (b.anchor?.turn ?? 0);
+        if (turnDelta !== 0) return turnDelta;
+        const msgDelta = (a.anchor?.msgOrder ?? 0) - (b.anchor?.msgOrder ?? 0);
+        if (msgDelta !== 0) return msgDelta;
+        const offsetDelta = (a.anchor?.rawOffset ?? -1) - (b.anchor?.rawOffset ?? -1);
+        if (offsetDelta !== 0) return offsetDelta;
+        const pinnedDelta = (a.pinnedAt ?? 0) - (b.pinnedAt ?? 0);
+        if (pinnedDelta !== 0) return pinnedDelta;
+        return String(a.id).localeCompare(String(b.id));
+      };
+      const byTime = (a, b) => {
+        const delta = (a.pinnedAt ?? 0) - (b.pinnedAt ?? 0);
+        if (delta !== 0) return delta;
+        return String(a.id).localeCompare(String(b.id));
+      };
+      const ordered = [...pins];
+      if (mode === 'context-asc') ordered.sort(byContext);
+      else if (mode === 'context-desc') ordered.sort((a, b) => byContext(b, a));
+      else if (mode === 'time-asc') ordered.sort(byTime);
+      else ordered.sort((a, b) => byTime(b, a));
+      return ordered;
+    }
+
     //#endregion
 
     //#region storage and store
@@ -69,11 +136,20 @@ window.__ModuleLoader__.load({
     }
 
     function normalizeData(raw) {
-      const data = { version: 1, order: [], sessions: {}, mode: readJson(MODE_KEY, 'session') };
+      const data = {
+        version: 1,
+        order: [],
+        sessions: {},
+        mode: readJson(MODE_KEY, 'session'),
+        // Context order by default: the list reads as an outline of the conversation,
+        // which is the point of the wall. An older record has no sort and gets this.
+        sort: 'context-asc',
+      };
       if (typeof raw !== 'object' || raw === null) return data;
       if (raw.sessions && typeof raw.sessions === 'object') data.sessions = raw.sessions;
       if (Array.isArray(raw.order)) data.order = raw.order.filter((id) => typeof id === 'string');
       data.mode = raw.mode === 'all' ? 'all' : 'session';
+      data.sort = normalizeSort(raw.sort);
       return data;
     }
 
@@ -371,33 +447,21 @@ window.__ModuleLoader__.load({
           data.mode = mode === 'all' ? 'all' : 'session';
           api.lastPersisted = commit();
         },
-        /** Pins of one Session in display order: the Session's own order, else source order. */
+        getSort() {
+          return normalizeSort(data.sort);
+        },
+        /** Step to the next order, in the fixed cycle the header button walks. */
+        cycleSort() {
+          const at = SORT_MODES.indexOf(normalizeSort(data.sort));
+          data.sort = SORT_MODES[(at + 1) % SORT_MODES.length];
+          api.lastPersisted = commit();
+          return data.sort;
+        },
+        /** Pins of one Session in the order the user chose. */
         list(sessionId) {
           const entry = sessionOf(sessionId, false);
           if (!entry || entry.pins.length === 0) return [];
-          if (Array.isArray(entry.order) && entry.order.length > 0) {
-            const byId = new Map(entry.pins.map((pin) => [pin.id, pin]));
-            const ordered = [];
-            for (const id of entry.order) {
-              const pin = byId.get(id);
-              if (pin) {
-                ordered.push(pin);
-                byId.delete(id);
-              }
-            }
-            for (const pin of entry.pins) if (byId.has(pin.id)) ordered.push(pin);
-            return ordered;
-          }
-          // Source order, by Turn. `seq` is not the primary key: it was hardcoded 0
-          // for a long time, so existing pins carry none, while `turn` was always
-          // captured from the row and is what the conversation itself is ordered by.
-          return [...entry.pins].sort((a, b) => {
-            const turnDelta = (a.anchor?.turn ?? 0) - (b.anchor?.turn ?? 0);
-            if (turnDelta !== 0) return turnDelta;
-            const seqDelta = (a.anchor?.seq ?? 0) - (b.anchor?.seq ?? 0);
-            if (seqDelta !== 0) return seqDelta;
-            return (a.pinnedAt ?? 0) - (b.pinnedAt ?? 0);
-          });
+          return sortPins(entry.pins, normalizeSort(data.sort));
         },
         count(sessionId) {
           return sessionOf(sessionId, false)?.pins.length ?? 0;
@@ -458,17 +522,31 @@ window.__ModuleLoader__.load({
           return sessionOf(sessionId, false)?.pins.find((pin) => sameAnchor(pin.anchor, anchor));
         },
         /**
-         * The pin living in one message, if any.
+         * The pin closest to one passage, with how far away it was.
          *
-         * Tagging a live selection needs this and must not use {@link find}: the
-         * stored quote is normalized while the toolbar carries the raw selection, so
-         * an exact comparison can miss the pin the user just created and silently
-         * create a second one. A tag action always belongs to the message the
-         * selection is in, so the message key is the correct and unambiguous scope.
+         * "Nearest in the message" is a distance, not an identity: two selections in one
+         * long reply are routinely hundreds of characters apart, and treating the nearer
+         * one as "the same passage" made a new selection extend the previous pin instead
+         * of creating its own. So the distance is returned rather than judged here, and
+         * the callers that ask "is this already pinned?" require an exact passage match.
+         *
+         * @returns `{ pin, distance }`; `distance` is `Infinity` when nothing matched and
+         *   `0` when the passage is pinned already.
          */
-        findByFlowKey(sessionId, flowKey) {
-          if (typeof flowKey !== 'string' || flowKey === '') return undefined;
-          return sessionOf(sessionId, false)?.pins.find((pin) => pin.anchor?.flowKey === flowKey);
+        findNearestByFlowKey(sessionId, flowKey, rawOffset) {
+          if (typeof flowKey !== 'string' || flowKey === '') return { pin: undefined, distance: Number.POSITIVE_INFINITY };
+          const pins = sessionOf(sessionId, false)?.pins ?? [];
+          let best = null;
+          let bestDistance = Number.POSITIVE_INFINITY;
+          for (const pin of pins) {
+            const distance = anchorDistance(pin.anchor, flowKey, rawOffset);
+            if (distance === Number.POSITIVE_INFINITY) continue;
+            if (distance < bestDistance) {
+              best = pin;
+              bestDistance = distance;
+            }
+          }
+          return { pin: best ?? undefined, distance: bestDistance };
         },
         add(sessionId, pin, title) {
           const entry = sessionOf(sessionId, true);
@@ -686,6 +764,10 @@ window.__ModuleLoader__.load({
           rawLength: rawQuote.length,
           quote,
           rawQuote,
+          // Where this message sits inside its turn, so context order has a key that
+          // works across every message kind. Read from the rows, because the engine's
+          // own ordering key is an opaque namespace.
+          msgOrder: messageOrderInTurn(source),
           block: singleBlock,
           lang: singleBlock === 'code' ? codeLanguageOf(startElement) : '',
           partial,
@@ -706,15 +788,91 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Position of one message inside its turn, in rendering order.
+     *
+     * The engine's own ordering (`data-chat-anchor-key` = `kind.length:kind` + id) is an
+     * internal namespace that cannot be decoded into numbers, so the order is taken
+     * from the rendered rows instead: their document order is the conversation's order,
+     * independent of message kind. Combined with the turn number this is what makes
+     * "context order" real — a pin added late still lands where its text sits.
+     *
+     * @returns the 0-based index of this message among the turn's rendered rows.
+     */
+    function messageOrderInTurn(element) {
+      try {
+        const turn = String(element.getAttribute('data-chat-turn') ?? '');
+        const key = element.getAttribute('data-chat-flow-key') ?? element.getAttribute('data-chat-node-key');
+        const rows = [...document.querySelectorAll('[data-chat-flow-key]')].filter(
+          (row) => row.getAttribute('data-chat-turn') === turn,
+        );
+        const at = rows.findIndex(
+          (row) => (row.getAttribute('data-chat-flow-key') ?? row.getAttribute('data-chat-node-key')) === key,
+        );
+        return at >= 0 ? at : 0;
+      } catch {
+        return 0;
+      }
+    }
+
+    /**
      * Whether two pins address the same passage.
      *
-     * A passage is identified by its message *and* its quote: one message may hold
-     * many pins, so keying on the message alone would allow only the first one and
-     * treat every later selection in that message as "already pinned".
+     * A passage is identified by its message *and* its text: one message may hold many
+     * pins, so keying on the message alone would allow only the first one and treat
+     * every later selection in that message as "already pinned".
+     *
+     * Text alone is not enough either. The two forms are compared independently,
+     * because a pin written before the raw form existed has only the normalized quote,
+     * and the normalized form loses the whitespace that separates two genuinely
+     * different passages in the same paragraph.
      */
     function sameAnchor(left, right) {
       if (!left || !right) return false;
-      return left.flowKey === right.flowKey && left.quote === right.quote;
+      if (left.flowKey !== right.flowKey) return false;
+      if (typeof left.rawQuote === 'string' && typeof right.rawQuote === 'string') {
+        return left.rawQuote === right.rawQuote;
+      }
+      return (left.quote ?? '') !== '' && left.quote === right.quote;
+    }
+
+    /**
+     * How close a pin sits to one offset inside its message, in characters.
+     *
+     * Used to pick which pin a live selection refers to when one message holds
+     * several: `Infinity` means "a different message, not a candidate".
+     */
+    function anchorDistance(anchor, flowKey, rawOffset) {
+      if (!anchor || anchor.flowKey !== flowKey) return Number.POSITIVE_INFINITY;
+      if (!Number.isFinite(rawOffset) || !Number.isFinite(anchor.rawOffset)) return Number.POSITIVE_INFINITY;
+      return Math.abs(anchor.rawOffset - rawOffset);
+    }
+
+    /**
+     * How near a pin must be to count as "the same passage" when only a distance can
+     * tell. A few characters covers a repeated read of the same range; anything larger
+     * is a different passage in the same message, and creating a second pin is right.
+     */
+    const SAME_PASSAGE_SLACK = 4;
+
+    /**
+     * Resolve one live selection to the pin it refers to, if that passage is pinned.
+     *
+     * @param store - the pin store.
+     * @param sessionId - Session the selection is in.
+     * @param anchor - the freshly read anchor.
+     * @returns the pin, or `undefined` when this passage is not pinned yet.
+     */
+    function findExistingPin(store, sessionId, anchor) {
+      if (!sessionId || !anchor) return undefined;
+      const exact = store.find(sessionId, anchor);
+      if (exact) return exact;
+      // Only a pin with no recorded position can be recognised by proximity: that is the
+      // migration case, not the normal one.
+      const { pin, distance } = store.findNearestByFlowKey(sessionId, anchor.flowKey, anchor.rawOffset);
+      if (pin && Number.isFinite(distance) && distance <= SAME_PASSAGE_SLACK && typeof pin.anchor?.rawQuote !== 'string') {
+        return pin;
+      }
+      return undefined;
     }
 
     //#endregion
@@ -1453,14 +1611,17 @@ window.__ModuleLoader__.load({
    rule keys off a data attribute: attribute selectors here once collided with
    the host's own overlay rules and with each other, which made the floating bar
    lay itself out as a column and cover the frame. */
-.dsh-pins-bar{position:fixed;z-index:30;display:inline-flex;flex-direction:row;align-items:center;gap:2px;
-  width:auto;height:auto;padding:3px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;
+.dsh-pins-bar{position:fixed;z-index:30;display:inline-flex;flex-flow:row wrap;align-content:center;
+  align-items:center;justify-content:center;gap:2px;row-gap:3px;
+  width:auto;max-width:min(400px, calc(100vw - 24px));height:auto;padding:3px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;
   background:var(--dsw-alias-bg-overlay);box-shadow:0 6px 20px rgba(0,0,0,.22);font-size:12px;
   color:var(--dsw-alias-label-primary);user-select:none;font-family:inherit;line-height:1;pointer-events:auto}
 .dsh-pins-bar button{display:inline-flex;align-items:center;height:26px;padding:0 9px;border:none;border-radius:7px;
   background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;white-space:nowrap}
 .dsh-pins-bar button:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .dsh-pins-bar button[data-primary]{color:var(--dsw-alias-brand-primary);font-weight:600}
+/* The tag button stays lit while its box is open, so the extra control has a visible owner. */
+.dsh-pins-bar button[data-on]{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .dsh-pins-bar .sep{width:1px;height:16px;margin:0 3px;background:var(--dsw-alias-border-l1);flex:none}
 .dsh-pins-bar input{width:104px;height:26px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
   border-radius:7px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none}
@@ -1481,6 +1642,13 @@ window.__ModuleLoader__.load({
   border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;cursor:pointer}
 .dsh-pins-root .search .clear:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
 .dsh-pins-root .count{font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}
+/* The header's action row: order switch and export, one compact row so the panel keeps
+   its scarce vertical space for the pins themselves. */
+.dsh-pins-root .tools{display:flex;gap:6px}
+.dsh-pins-root .tool{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);
+  border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;cursor:pointer}
+.dsh-pins-root .tool:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
+.dsh-pins-root .tool-icon{color:var(--dsw-alias-label-tertiary);font-size:11px}
 /* A query container so the expanded cap can be a share of the LIST viewport rather
    than of the window: the right column is often shorter than the window, and viewport
    units would then allow a card taller than the list itself. */
@@ -1494,8 +1662,9 @@ window.__ModuleLoader__.load({
   text-align:left;font:inherit;color:inherit;cursor:pointer}
 .dsh-pins-card:hover{border-color:var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2)}
 .dsh-pins-card[data-current]{border-color:var(--dsw-alias-brand-primary)}
-.dsh-pins-card .meta{display:flex;align-items:center;gap:5px;margin-bottom:4px;font-size:10px;
-  color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-card .meta{position:relative;display:flex;align-items:center;gap:5px;margin-bottom:4px;font-size:10px;
+  color:var(--dsw-alias-label-tertiary);min-height:18px}
+.dsh-pins-card .meta .time{margin-left:auto}
 .dsh-pins-card .dot{width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);flex:none}
 .dsh-pins-card[data-kind="user"] .dot{background:var(--dsw-alias-brand-primary)}
 .dsh-pins-card .txt{white-space:pre-wrap;overflow-wrap:anywhere;overflow:hidden;
@@ -1575,11 +1744,15 @@ window.__ModuleLoader__.load({
 .dsh-pins-root .tagrow-head{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1.5}
 .dsh-pins-root .tagrow-chips{display:flex;flex-wrap:wrap;gap:4px}
 .dsh-pins-root .tagrow-chips .tag{border:none;font-family:inherit}
-.dsh-pins-card .ops{position:absolute;top:5px;right:5px;display:none;gap:2px}
-.dsh-pins-card:hover .ops,.dsh-pins-card:focus-within .ops{display:flex}
+.dsh-pins-card .ops{position:absolute;top:0;right:0;display:none;gap:2px;align-items:center;
+  height:100%;padding-left:6px;background:var(--dsw-alias-bg-layer-1);border-radius:6px}
+.dsh-pins-card:hover .ops,.dsh-pins-card:focus-within .ops{display:flex;background:var(--dsw-alias-bg-layer-2)}
 /* An expanded card keeps its controls in place: the passage below it is a jump target,
    so the editor's own entry point must not depend on the pointer staying over the card. */
-.dsh-pins-card[data-open] .ops{display:flex}
+.dsh-pins-card[data-open] .ops{display:flex;background:var(--dsw-alias-bg-layer-2)}
+/* The time is what the actions cover, so it steps aside instead of showing through the
+   gaps between buttons. */
+.dsh-pins-card:hover .meta .time,.dsh-pins-card:focus-within .meta .time,.dsh-pins-card[data-open] .meta .time{visibility:hidden}
 .dsh-pins-card .ops button{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;
   border:none;border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);
   font:inherit;font-size:12px;cursor:pointer}
@@ -1619,6 +1792,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
   background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;
   cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.2);pointer-events:auto}
 .dsh-pins-return:hover{background:var(--dsw-alias-bg-layer-2)}
+.dsh-pins-bar .btn-quote{color:var(--dsw-alias-label-secondary)}
+
+/* Left sidebar entry: an icon button in the panel row, with a count badge. The size
+   token comes from the host when it publishes one. */
+.dsh-pins-panel-entry{position:relative;display:inline-flex;align-items:center;justify-content:center;
+  width:var(--dsh-panel-entry-size, 32px);height:var(--dsh-panel-entry-size, 32px);padding:0;border:none;border-radius:8px;
+  background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}
+.dsh-pins-panel-entry:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.dsh-pins-panel-entry.is-active{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.dsh-pins-panel-count{position:absolute;top:1px;right:1px;min-width:13px;height:13px;padding:0 3px;border-radius:999px;
+  background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);font-size:9px;line-height:13px;text-align:center;
+  font-family:inherit;pointer-events:none}
 `;
       try {
         const element = document.createElement('style');
@@ -1641,55 +1826,155 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const [draft, setDraft] = React.useState('');
       const inputRef = React.useRef(null);
 
+      // Mount/unmount in the log: a bar that appears and disappears while the user is
+      // still working is exactly what the reason strings are meant to name.
       React.useEffect(() => {
-        if (tagging) inputRef.current?.focus();
+        console.log('[dsh-pins] 浮条出现');
+        return () => console.log('[dsh-pins] 浮条消失');
+      }, []);
+
+      React.useEffect(() => {
+        if (!tagging) return;
+        const input = inputRef.current;
+        if (!input) return;
+        input.focus();
+        // Focus is what keeps the tag box usable; if the browser refuses it, the state
+        // is wrong rather than the click, so it is worth saying out loud once.
+        if (document.activeElement !== input) {
+          console.warn('[dsh-pins] 标签输入框没能获得焦点，activeElement =', document.activeElement);
+        }
       }, [tagging]);
 
       const submitTag = () => {
         const tag = normalizeTag(draft);
+        // Enter is the one place an empty box is worth mentioning: the user explicitly
+        // asked to apply a tag and there is none. Every other button treats an empty box
+        // as "no tag" and does its own job.
+        if (tag === '') {
+          announceHere('先写一个标签名，再按回车');
+          return;
+        }
         setDraft('');
         setTagging(false);
-        if (tag !== '') onAction({ type: 'tag', tag });
+        onAction({ type: 'tag', tag });
+      };
+
+      /**
+       * The tag typed so far, or `undefined` when there is nothing usable.
+       *
+       * An empty or punctuation-only box is deliberately *not* an error: the user may
+       * have opened it by accident, or simply not filled it in, and the click they then
+       * make still means what it says. Only a real tag is carried into the action.
+       */
+      const pendingTag = () => {
+        const tag = normalizeTag(draft);
+        return tag === '' ? undefined : tag;
+      };
+
+      /** Run an action, then clear the tag box: whatever it meant, it has been used. */
+      const runAction = (build) => {
+        setDraft('');
+        setTagging(false);
+        onAction(build(pendingTag()));
       };
 
       const buttons = [];
 
-      if (state.pinned) {
-        buttons.push(h('button', { key: 'unpin', type: 'button', onClick: () => onAction({ type: 'unpin' }) }, '取消固定'));
-      } else {
-        buttons.push(
-          h(
-            'button',
-            { key: 'pin', type: 'button', 'data-primary': '', onClick: () => onAction({ type: 'pin' }) },
-            state.truncated ? `固定前 ${MAX_CHARS} 字` : '固定',
-          ),
-        );
-        if (tagging) {
-          buttons.push(
-            h('input', {
-              key: 'tag',
-              ref: inputRef,
-              value: draft,
-              placeholder: '标签，回车',
-              onChange: (event) => setDraft(event.target.value),
-              onKeyDown: (event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault();
-                  submitTag();
-                } else if (event.key === 'Escape') {
-                  event.preventDefault();
-                  setTagging(false);
-                }
+      // One flat row: every action the selection supports is visible at once, so
+      // "pin and quote" is never hidden behind opening the tag box first. The tag box
+      // is an optional extra *inline* control, not a second level of the bar.
+      buttons.push(
+        state.pinned
+          ? h(
+              'button',
+              { key: 'unpin', type: 'button', title: '取消这段的固定', onClick: () => runAction(() => ({ type: 'unpin' })) },
+              '取消',
+            )
+          : h(
+              'button',
+              {
+                key: 'pin',
+                type: 'button',
+                'data-primary': '',
+                title: state.truncated ? `超过 ${MAX_CHARS} 字，固定前 ${MAX_CHARS} 字` : '固定这段文字到右侧栏',
+                onClick: () => runAction((tag) => (tag === undefined ? { type: 'pin' } : { type: 'tag', tag })),
               },
-            }),
-          );
-        } else {
-          buttons.push(h('button', { key: 'addtag', type: 'button', onClick: () => setTagging(true) }, '加标签'));
-        }
+              '固定',
+            ),
+      );
+
+      buttons.push(
+        h(
+          'button',
+          {
+            key: 'addtag',
+            type: 'button',
+            'data-on': tagging ? '' : undefined,
+            title: tagging ? '收起标签输入框' : '展开标签输入框（可加标签，也可以什么都不填）',
+            onClick: () => setTagging((value) => !value),
+          },
+          '标签',
+        ),
+      );
+
+      if (tagging) {
+        buttons.push(
+          h('input', {
+            key: 'tag',
+            ref: inputRef,
+            value: draft,
+            placeholder: '标签，回车',
+            onChange: (event) => setDraft(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                submitTag();
+              } else if (event.key === 'Escape') {
+                event.preventDefault();
+                setTagging(false);
+              }
+            },
+          }),
+        );
       }
 
+      // Quote helpers carry the tag along exactly like "固定" does, so a tag typed and
+      // then applied through any of the three actions lands the same way.
+      buttons.push(
+        h(
+          'button',
+          {
+            key: 'pinquote',
+            type: 'button',
+            title: '固定这段并把引用放进输入框（写了标签就一起打上）',
+            onClick: () => runAction((tag) => ({ type: 'quote', tag, alsoPin: true })),
+          },
+          '固定并引用',
+        ),
+      );
       buttons.push(h('span', { key: 'sep', className: 'sep' }));
-      buttons.push(h('button', { key: 'copy', type: 'button', onClick: () => onAction({ type: 'copy' }) }, '复制'));
+      // The quote goes into the composer as a self-contained quote block, so it needs
+      // no lifetime and no pointer that could rot; pinning is a separate, deliberate step.
+      buttons.push(
+        h(
+          'button',
+          {
+            key: 'quote',
+            type: 'button',
+            className: 'btn-quote',
+            title: '把这段作为引用放进输入框（不固定，发送后就随消息一起存在）',
+            onClick: () => runAction(() => ({ type: 'quote' })),
+          },
+          '引用',
+        ),
+      );
+      buttons.push(
+        h(
+          'button',
+          { key: 'copy', type: 'button', title: '只复制到剪贴板', onClick: () => runAction(() => ({ type: 'copy' })) },
+          '复制',
+        ),
+      );
 
       const rect = state.rect;
       const above = rect ? rect.top - TOOLBAR_HEIGHT - 8 : 0;
@@ -1701,13 +1986,15 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         'div',
         {
           className: 'dsh-pins-bar',
+          'data-dsh-pins-bar': '',
           style: { top: `${Math.max(8, Math.round(top))}px`, left: `${Math.round(left)}px` },
           onMouseDown: (event) => event.preventDefault(),
-          // Leaving the bar puts the tag editor away, so clicking anywhere else in
-          // the app dismisses it. Moving focus between the bar's own buttons keeps
-          // it open.
+          // Focus leaving the bar closes the tag box. Moving focus between the bar's own
+          // buttons keeps it open; anything else means the user went elsewhere.
           onBlur: (event) => {
-            if (!event.currentTarget.contains(event.relatedTarget)) setTagging(false);
+            if (event.currentTarget.contains(event.relatedTarget)) return;
+            console.log('[dsh-pins] 标签输入框收起：焦点离开浮条');
+            setTagging(false);
           },
         },
         buttons,
@@ -1729,41 +2016,99 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const actionRef = React.useRef(() => {});
       stateRef.current = state;
 
+      // Late-bound so the notice effect below can call `say` without being re-created.
+      const sayRef = React.useRef(() => {});
+
       const liveSession = React.useCallback(() => {
         try {
-          return context?.get?.('sidebarRight')?.mounted?.getSnapshot?.() ?? null;
+          const mounted = context?.get?.('sidebarRight')?.mounted?.getSnapshot?.() ?? null;
+          if (mounted) return mounted;
         } catch {
-          return null;
+          /* the sidebar service may be absent; the list below is the fallback */
         }
+        // `mounted` is the on-screen Session, and it is legitimately empty while a global
+        // panel covers the main column. A selection can only come from the conversation
+        // though, so that is not a reason to refuse the action — the Session the
+        // conversation is showing is the one to use.
+        try {
+          const current = context?.get?.('sessions')?.list?.getSnapshot?.()?.current;
+          if (current) return current;
+        } catch {
+          /* no list either: the bar will report that it cannot act */
+        }
+        return null;
       }, [context]);
 
       const [sessionId, setSessionId] = React.useState(() => liveSession());
 
       React.useEffect(() => {
+        /** The session the bar should act on: the on-screen one, else the conversation's. */
+        const sync = () => {
+          const next = liveSession();
+          setSessionId(next);
+          setMarkedSession(next);
+        };
         let service = null;
         try {
           service = context?.get?.('sidebarRight') ?? null;
         } catch {
           service = null;
         }
+        sync();
+        // Following the sidebar's published Session keeps the marks in step with what is
+        // on screen; without that service the fallback above is still enough to act.
         if (!service?.mounted?.subscribe) {
-          // Without the Sidebar's published Session the panel cannot be opened
-          // from here; the pin still lands, and this says so once.
-          console.error('[dsh-pins] sidebarRight.mounted 不可用：固定后无法自动展开右侧栏');
+          console.warn('[dsh-pins] sidebarRight.mounted 不可用：改为按当前会话工作');
           return undefined;
         }
-        const sync = () => {
-          const next = service.mounted.getSnapshot() ?? null;
-          setSessionId(next);
-          setMarkedSession(next);
-        };
-        sync();
         return service.mounted.subscribe(sync);
       }, [context, liveSession]);
 
       // A new pin (from anywhere, including the panel) redraws the marks.
       // A pin changed: redraw the marks, without pretending the DOM moved.
       React.useEffect(() => store.subscribe(() => scheduleMarkers(false)), []);
+
+      const say = React.useCallback((text) => {
+        setNotice(text);
+        window.setTimeout(() => setNotice(''), 3200);
+      }, []);
+      sayRef.current = say;
+
+      // A notice raised by a click in the bar belongs next to the selection, not in the
+      // panel: the bar acts on a passage, and the panel may not be open at all.
+      React.useEffect(() => {
+        const onNotice = (event) => {
+          if (event.detail?.surface !== 'floating') return;
+          sayRef.current(String(event.detail?.text ?? ''));
+        };
+        PINS_EVENTS.addEventListener('notice', onNotice);
+        return () => PINS_EVENTS.removeEventListener('notice', onNotice);
+      }, []);
+
+      /**
+       * The one way the bar leaves.
+       *
+       * A bar that vanishes on its own is the hardest kind of defect to chase, because
+       * every close path looks innocent in isolation. Funnelling them through here means
+       * the reason is always known: it goes to the console, and a bar that closes within
+       * a second and a half of appearing says so on screen too — that case is never what
+       * the user asked for, and making them open DevTools to find out is a bad trade.
+       */
+      const barOpenedAt = React.useRef(0);
+      const noteShown = React.useRef(false);
+      React.useEffect(() => {
+        noteShown.current = notice !== '';
+      }, [notice]);
+
+      const dismissBar = React.useCallback((reason) => {
+        console.log(`[dsh-pins] 收起浮条：${reason}`);
+        setState(null);
+        const lived = Date.now() - barOpenedAt.current;
+        if (lived > 0 && lived < 1500 && noteShown.current === false) {
+          setNotice(`浮条自己收起了（${reason}）——如果这不是你点的，请把这句话发给我`);
+          window.setTimeout(() => setNotice(''), 6000);
+        }
+      }, []);
 
       const accept = React.useCallback(
         (range) => {
@@ -1772,32 +2117,30 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             if (isOwnUi(range.startContainer) || isOwnUi(range.endContainer)) return;
             const anchor = readAnchor(range);
             if (!anchor.ok) {
-              setState(null);
+              // A selection the reader rejects is normal while the pointer moves; only
+              // report it when a bar was actually up.
+              if (stateRef.current) dismissBar(`选区读不出来（${anchor.reason}）`);
               return;
             }
             const rect = range.getBoundingClientRect();
             const target = liveSession();
+            barOpenedAt.current = Date.now();
             setState({
               anchor: anchor.anchor,
               text: anchor.text,
               truncated: anchor.truncated,
               rect: { top: rect.top, bottom: rect.bottom, left: rect.left, width: Math.max(1, rect.width) },
-              pinned: target ? Boolean(store.find(target, anchor.anchor)) : false,
+              pinned: target ? Boolean(findExistingPin(store, target, anchor.anchor)) : false,
             });
           } catch (error) {
             // A selection may be read while its nodes are being replaced (streaming
             // markdown); never let that escape an event listener.
             console.error('[dsh-pins] 读取选区失败', error);
-            setState(null);
+            dismissBar('读选区时抛异常');
           }
         },
-        [liveSession],
+        [liveSession, dismissBar],
       );
-
-      const say = React.useCallback((text) => {
-        setNotice(text);
-        window.setTimeout(() => setNotice(''), 3000);
-      }, []);
 
       /**
        * Reveal the panel, and report the reason when it cannot be revealed.
@@ -1836,7 +2179,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             } catch {
               /* the clipboard can refuse outside a user gesture; copying stays best-effort */
             }
-            setState(null);
+            dismissBar('复制之后');
             return;
           }
 
@@ -1846,11 +2189,30 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             return;
           }
 
+          if (action.type === 'quote') {
+            // The composer is a session-scoped surface the bar cannot reach; the panel
+            // performs the insertion (and the pin, when the gesture carries a tag) and
+            // reports back, so the outcome is stated here rather than leaving the click
+            // looking ignored.
+            const anchor = { ...current.anchor, sessionId: String(target) };
+            const already = findExistingPin(store, target, anchor);
+            const origin = already ? pinOrigin(already, readSessionTitle(context, target)) : '';
+            dismissBar(action.alsoPin === true ? '固定并引用之后' : '引用之后');
+            void requestQuote(anchor, current.text, origin, action.alsoPin === true, action.tag).then((outcome) => {
+              const pinned = action.alsoPin === true ? '已固定并' : '';
+              if (outcome.viaClipboard) say(`${pinned}把引用复制到了剪贴板（没有可用的输入框）`);
+              else if (outcome.ok) say(`${pinned}把引用放进输入框`);
+              else if (outcome.reason === 'no-panel') say('右侧栏没打开，已复制到剪贴板');
+              else say(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
+            });
+            return;
+          }
+
           if (action.type === 'unpin') {
-            const existing = store.find(target, current.anchor);
+            const existing = findExistingPin(store, target, current.anchor);
             if (existing) store.remove(target, existing.id);
-            setState(null);
-            say('已取消固定');
+            dismissBar('取消固定之后');
+            say(existing ? '已取消固定' : '这一段本来就没有固定');
             return;
           }
 
@@ -1858,14 +2220,11 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             let record = null;
             let tagAdded = null;
             try {
-              // A tag action belongs to the message the selection is in: matching on
-              // the passage signature here would miss the pin the user just made
-              // (the toolbar carries the raw selection, the pin keeps the normalized
-              // quote) and quietly create a second pin under the same tag.
-              const existing =
-                action.type === 'tag'
-                  ? (store.findByFlowKey(target, current.anchor.flowKey) ?? store.find(target, current.anchor))
-                  : store.find(target, current.anchor);
+              // Whether this passage is already pinned is an identity question, not a
+              // distance question: a nearby pin in the same message is a different
+              // passage, and treating it as the same one made a new selection attach its
+              // tag to the previous pin. Only an exact passage matches.
+              const existing = findExistingPin(store, target, current.anchor);
               record =
                 existing ??
                 store.add(target, {
@@ -1885,7 +2244,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               say(`保存失败：${String(error?.message ?? error)}`);
               return;
             }
-            setState(null);
+            dismissBar(action.type === 'tag' ? '固定并打标签之后' : '固定之后');
             scheduleMarkers(false);
             if (action.type === 'tag' && tagAdded === false) {
               say(`已经有 #${action.tag} 这个标签了`);
@@ -1901,19 +2260,42 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             say(panelProblem !== '' ? `已固定 ${count} 条 · ${panelProblem}` : `已固定 ${count} 条（原文已加标记）`);
           }
         },
-        [liveSession, say, showPanel],
+        [liveSession, say, showPanel, dismissBar],
       );
       actionRef.current = onAction;
 
       React.useEffect(() => {
+        /** Whether the user has the bar in hand: focus inside it, or a live tag box. */
+        const barInUse = () => {
+          try {
+            const active = document.activeElement;
+            if (active && active.closest?.('[data-dsh-pins-bar]')) return true;
+            const bar = document.querySelector('[data-dsh-pins-bar]');
+            if (bar && bar.contains(document.activeElement)) return true;
+          } catch {
+            /* fall through to "not in use" */
+          }
+          return false;
+        };
         const onSelectionChange = () => {
           const range = dom.range();
-          if (range) accept(range);
-          else if (stateRef.current) setState(null);
+          if (range) {
+            accept(range);
+            return;
+          }
+          if (!stateRef.current) return;
+          // A tag box that is being typed into must survive a late, collapsed
+          // selectionchange: that event is a side effect of focus moving, not the user
+          // abandoning the passage.
+          if (barInUse()) {
+            console.log('[dsh-pins] 选区没了，但浮条正在被操作，保留');
+            return;
+          }
+          dismissBar('选区没了（点了别处或浏览器清了选区）');
         };
         const onKeyDown = (event) => {
           if (event.key === 'Escape' && stateRef.current) {
-            setState(null);
+            dismissBar('按了 Esc');
             return;
           }
           if (event.altKey && !event.ctrlKey && !event.metaKey && (event.key === 'p' || event.key === 'P')) {
@@ -1922,16 +2304,46 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             actionRef.current({ type: stateRef.current.pinned ? 'unpin' : 'pin' });
           }
         };
-        const onBlur = () => setState(null);
+        const onBlur = () => {
+          if (!stateRef.current) return;
+          let active = '（读不到焦点）';
+          try {
+            const focused = document.activeElement;
+            if (focused) {
+              const inside = focused.closest?.('[data-dsh-pins-bar]') !== null && focused.closest?.('[data-dsh-pins-bar]') !== undefined;
+              const tag = focused.tagName.toLowerCase();
+              const cls = focused.className ? `.${String(focused.className).slice(0, 40)}` : '';
+              active = `${tag}${cls}${inside ? ' [浮条内]' : ''}`;
+            } else {
+              active = '（无）';
+            }
+          } catch {
+            /* the log is best-effort */
+          }
+          dismissBar(`窗口失去焦点，当时的焦点在 ${active}`);
+        };
+        // The bar is anchored to a rectangle measured once. Scrolling or resizing moves
+        // that rectangle out from under it, and a bar floating next to the wrong line is
+        // worse than no bar, so it leaves instead of pointing at nothing. The scroll
+        // listener is in the capture phase because the conversation scrolls inside its
+        // own container, and scroll events do not bubble.
+        const onScrollOrResize = () => {
+          if (!stateRef.current) return;
+          dismissBar('页面滚动或窗口缩放了');
+        };
         document.addEventListener('selectionchange', onSelectionChange);
         document.addEventListener('keydown', onKeyDown, true);
+        document.addEventListener('scroll', onScrollOrResize, true);
         window.addEventListener('blur', onBlur);
+        window.addEventListener('resize', onScrollOrResize);
         return () => {
           document.removeEventListener('selectionchange', onSelectionChange);
           document.removeEventListener('keydown', onKeyDown, true);
+          document.removeEventListener('scroll', onScrollOrResize, true);
           window.removeEventListener('blur', onBlur);
+          window.removeEventListener('resize', onScrollOrResize);
         };
-      }, [accept]);
+      }, [accept, dismissBar]);
 
       return h(
         React.Fragment,
@@ -2032,7 +2444,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     }
 
     function announce(text) {
-      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: text }));
+      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'panel' } }));
+    }
+
+    /**
+     * Report something next to the selection instead of inside the panel.
+     *
+     * The bar acts on a passage, not on the panel, and the panel may not even be open —
+     * a notice about the bar that only lands there is a notice the user never sees.
+     * Anything a click in the bar produces therefore goes to the floating surface.
+     */
+    function announceHere(text) {
+      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'floating' } }));
     }
 
     /**
@@ -2172,6 +2595,197 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#endregion
 
+    //#region export
+
+    /** One line of attribution for a quote block: where the passage came from. */
+    function pinOrigin(pin, title) {
+      const bits = [];
+      if (title) bits.push(title);
+      if (pin.anchor?.turn) bits.push(`第 ${pin.anchor.turn} 轮`);
+      bits.push(sourceLabel(pin));
+      if (pin.anchor?.block === 'code') bits.push(`代码${pin.anchor.lang ? ` ${pin.anchor.lang}` : ''}`);
+      return bits.join(' · ');
+    }
+
+    function quoteBlock(text) {
+      return String(text ?? '')
+        .replace(/\r\n?/g, '\n')
+        .split('\n')
+        .map((line) => `> ${line}`)
+        .join('\n');
+    }
+
+    /**
+     * Turn the panel's current view into a markdown outline and hand it to the browser.
+     *
+     * It exports exactly what is on screen — the same search and tag filters, the same
+     * sort, the same two scopes — because an export that disagrees with the view it was
+     * taken from is an export the user has to check by hand.
+     *
+     * Pins whose passage could not be re-located on screen are listed separately rather
+     * than being dropped: a silent omission is how a "complete" outline becomes wrong.
+     * Downloading needs no host, so this works in any browser; when the Blob URL route
+     * is refused, the text is copied instead of being lost.
+     *
+     * @param input - the view to export: scope, filters, and how to read pins and titles.
+     * @returns a message describing what happened, for the panel's notice.
+     */
+    function exportOutline(input) {
+      try {
+        const stamp = new Date();
+        const pad = (value) => String(value).padStart(2, '0');
+        const dateLine = `${stamp.getFullYear()}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())} ${pad(stamp.getHours())}:${pad(stamp.getMinutes())}`;
+        const matches = (pin) =>
+          matchesQuery(pin, input.query ?? '') &&
+          (input.tagFilter === undefined || input.tagFilter.size === 0
+            ? true
+            : [...input.tagFilter].some((tag) => (pin.tags ?? []).includes(tag)));
+
+        const groups = [];
+        if (input.mode === 'all') {
+          for (const [id, entry] of input.sessions) {
+            const pins = input.list(id).filter(matches);
+            if (pins.length > 0) groups.push({ id, entry, pins, title: input.titleOf(id) });
+          }
+        } else if (input.sessionId) {
+          const pins = input.list(input.sessionId).filter(matches);
+          if (pins.length > 0) {
+            const entry = input.sessions.find(([id]) => id === input.sessionId)?.[1] ?? {};
+            groups.push({ id: input.sessionId, entry, pins, title: input.titleOf(input.sessionId) });
+          }
+        }
+
+        const lines = [];
+        lines.push('# 固定片段提纲');
+        lines.push('');
+        lines.push(`导出时间：${dateLine}`);
+        const scope = input.mode === 'all' ? `全部对话（${groups.length} 个）` : '本对话';
+        const filters = [];
+        if (input.query) filters.push(`搜索「${input.query}」`);
+        if (input.tagFilter?.size > 0) filters.push(`标签 ${[...input.tagFilter].map((tag) => `#${tag}`).join(' ')}`);
+        lines.push(`范围：${scope}${filters.length > 0 ? ` · 筛选：${filters.join(' · ')}` : ''}`);
+        lines.push(`排序：${SORT_LABELS[input.sort] ?? SORT_LABELS['context-asc']}`);
+        lines.push('');
+
+        let exported = 0;
+        let unlocated = 0;
+        for (const group of groups) {
+          const title = group.title || group.entry?.title || sessionLabel(group.entry ?? {});
+          lines.push(`## ${title}`);
+          lines.push('');
+          for (const pin of group.pins) {
+            lines.push(`### ${pinOrigin(pin, '') || '片段'}`);
+            lines.push('');
+            lines.push(quoteBlock(pin.text ?? pin.anchor?.quote ?? ''));
+            lines.push('');
+            const meta = [];
+            if (Array.isArray(pin.tags) && pin.tags.length > 0) meta.push(`标签：${pin.tags.map((tag) => `#${tag}`).join(' ')}`);
+            meta.push(`固定于 ${relTime(pin.pinnedAt) || '未知时间'}`);
+            if (pin.anchor?.partial === true) meta.push('选区是不完整的片段');
+            if (markerReport.get(pin.id) === 'miss') {
+              meta.push('**原文未定位**');
+              unlocated += 1;
+            }
+            lines.push(`_${meta.join(' · ')}_`);
+            lines.push('');
+            exported += 1;
+          }
+        }
+
+        if (exported === 0) return { ok: false, message: '当前视图里没有可导出的片段' };
+
+        lines.push('---');
+        lines.push('');
+        lines.push(`共 ${exported} 条固定片段。`);
+        if (unlocated > 0) {
+          lines.push('');
+          lines.push(
+            `其中 ${unlocated} 条在导出时未能定位到原文（卡片上标了「原文未找到」）；它们的内容仍然完整，只是跳转可能落回整条消息。`,
+          );
+        }
+        const markdown = lines.join('\n');
+
+        const name = `固定片段提纲-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}.md`;
+        try {
+          const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement('a');
+          anchor.href = url;
+          anchor.download = name;
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+          return { ok: true, message: `已导出 ${exported} 条到 ${name}` };
+        } catch (error) {
+          console.error('[dsh-pins] 下载失败，改复制到剪贴板', error);
+          try {
+            void navigator.clipboard?.writeText(markdown);
+            return { ok: true, message: `下载被拒绝，已把 ${exported} 条提纲复制到剪贴板` };
+          } catch {
+            return { ok: false, message: '导出失败：浏览器既不允许下载也不允许写剪贴板' };
+          }
+        }
+      } catch (error) {
+        console.error('[dsh-pins] 导出失败', error);
+        return { ok: false, message: `导出失败：${String(error?.message ?? error)}` };
+      }
+    }
+
+    //#endregion
+
+    //#region quoting into the composer
+
+    /**
+     * The quote block that goes into the composer.
+     *
+     * The content is carried *inside* the message rather than referenced by a pointer.
+     * That is the whole design: a pointer would leave the model with a name it cannot
+     * resolve, and would rot as soon as whatever it pointed at expired — the same
+     * silent decay the storage warning was added to end. A quote is self-contained, so
+     * it stays readable in the sent message forever and needs no cache or lifetime.
+     */
+    function buildQuote(text, origin) {
+      const body = quoteBlock(text);
+      return origin ? `> ${origin}\n${body}` : body;
+    }
+
+    /**
+     * Ask the panel to put a quote into the composer.
+     *
+     * The composer's actions are a session-scoped slot prop, and the floating bar lives
+     * at root scope where they do not exist. The bar therefore asks the panel, which
+     * does receive them; the panel answers by reporting the outcome.
+     */
+    function requestQuote(anchor, text, origin, alsoPin, tag) {
+      return new Promise((resolve) => {
+        const token = `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+        let settled = false;
+        const finish = (outcome) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
+          PINS_EVENTS.removeEventListener('quote-done', onDone);
+          resolve(outcome);
+        };
+        const onDone = (event) => {
+          if (event.detail?.token !== token) return;
+          finish(event.detail);
+        };
+        // No panel listening means no composer surface at all (the right column is
+        // closed); the caller then copies instead of pretending it worked.
+        const timer = window.setTimeout(() => finish({ ok: false, reason: 'no-panel' }), 600);
+        PINS_EVENTS.addEventListener('quote-done', onDone);
+        PINS_EVENTS.dispatchEvent(
+          new CustomEvent('quote-req', {
+            detail: { token, sessionId: anchor?.sessionId ?? '', anchor, text, origin, alsoPin: alsoPin === true, tag },
+          }),
+        );
+      });
+    }
+
+    //#endregion
+
     //#region sidebar panel
 
     /**
@@ -2191,7 +2805,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * that strip. `padding` would not do this: padding belongs to the scroller, so the
      * wheel would keep scrolling the text.
      */
-    function PinCard({ sessionId, pin, current, taggable, onTagChange, context, cardState }) {
+    function PinCard({ sessionId, pin, current, taggable, onTagChange, onQuote, context, cardState }) {
       const [draft, setDraft] = React.useState('');
       const rootRef = React.useRef(null);
       const open = cardState?.isOpen?.(pin.id) === true;
@@ -2212,8 +2826,15 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
       const submit = () => {
         const tag = normalizeTag(draft);
+        const typed = draft.trim() !== '';
         setDraft('');
-        if (tag === '') return;
+        if (tag === '') {
+          // Typing only `#` normalized to nothing; say so instead of clearing the box
+          // and appearing to have accepted it. This happens in the panel, so the panel
+          // is where it belongs.
+          if (typed) announce('标签名不能只有 # 或空格');
+          return;
+        }
         const added = onTagChange('add', tag);
         // Adding never removes, so say why nothing happened instead of toggling.
         if (added === false) announce(`已经有 #${tag} 这个标签了`);
@@ -2286,6 +2907,21 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               '#',
             )
           : null,
+        typeof onQuote === 'function'
+          ? h(
+              'button',
+              {
+                key: 'quote',
+                type: 'button',
+                title: '把这段作为引用放进输入框',
+                onClick: (event) => {
+                  event.stopPropagation();
+                  onQuote(pin);
+                },
+              },
+              '❞',
+            )
+          : null,
         h(
           'button',
           {
@@ -2356,7 +2992,11 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           markerReport.get(pin.id) === 'miss'
             ? h('span', { className: 'warn', title: '这条消息在屏幕上，但没能定位到选中的文字：请点这条卡片，然后告诉我现象' }, '原文未找到')
             : null,
-          h('span', { style: { marginLeft: 'auto' } }, relTime(pin.pinnedAt)),
+          h('span', { className: 'time' }, relTime(pin.pinnedAt)),
+          // The actions live inside the meta row, and the row hides its own trailing text
+          // while they show. They used to sit on the card instead, which left the time
+          // visible *through* the gap between two buttons.
+          h('div', { className: 'ops' }, ops),
         ),
         h('div', { className: `${bodyClass}${open ? ' is-open' : ''}` }, fullText),
         Array.isArray(pin.tags) && pin.tags.length > 0
@@ -2443,7 +3083,6 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               }),
             )
           : null,
-        h('div', { className: 'ops' }, ops),
       );
     }
 
@@ -2480,6 +3119,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const [query, setQuery] = React.useState('');
       const [tagFilter, setTagFilter] = React.useState(() => new Set());
       const [notice, setNotice] = React.useState('');
+      const [sort, setSort] = React.useState(() => store.getSort());
 
       // Which card is expanded, and which expanded card is in its tag editor. Two
       // ids rather than one "state" so the editor survives a re-render of the list.
@@ -2562,6 +3202,91 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
       React.useEffect(() => clearHoverTimers, [clearHoverTimers]);
 
+      /**
+       * Insert a quote block into the composer.
+       *
+       * The composer accepts text through a revision-guarded span, so the insertion is
+       * a capture-then-insert pair; `insertText` returns false when the draft changed in
+       * between or submission locked the editor, which is worth trying once more rather
+       * than silently dropping the quote.
+       *
+       * @returns `{ ok, message }` — a failure carries the reason the caller shows.
+       */
+      const insertIntoComposer = React.useCallback(
+        (markdown) => {
+          const actions = props?.inputActions;
+          if (!actions || typeof actions.insertText !== 'function') {
+            return { ok: false, message: '当前没有可用的输入框（右栏可能没有绑定到对话）' };
+          }
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              const span = typeof actions.captureInsertion === 'function' ? actions.captureInsertion() : undefined;
+              if (span === undefined || span === null) continue;
+              if (actions.insertText(markdown, span) === true) return { ok: true };
+            } catch (error) {
+              console.error('[dsh-pins] 写入输入框失败', error);
+              return { ok: false, message: String(error?.message ?? error) };
+            }
+          }
+          return { ok: false, message: '输入框正在提交或草稿已变化，没能插入' };
+        },
+        [props?.inputActions],
+      );
+
+      // The floating bar lives at root scope, where the composer's actions do not exist,
+      // so it asks the panel to insert on its behalf and the panel answers by token.
+      React.useEffect(() => {
+        const onRequest = (event) => {
+          const detail = event.detail ?? {};
+          const answer = (payload) => {
+            PINS_EVENTS.dispatchEvent(new CustomEvent('quote-done', { detail: { token: detail.token, ...payload } }));
+          };
+          try {
+            // "Quote and pin" is one gesture: the pin is written first, so a quote that
+            // fails to insert still leaves the passage in the panel rather than nowhere.
+            if (detail.alsoPin === true && sessionId) {
+              // Identity, not proximity: a different passage in the same message must get
+              // its own pin instead of lending its tag to the previous one.
+              const existing = findExistingPin(store, sessionId, { ...(detail.anchor ?? {}), sessionId: String(sessionId) });
+              if (!existing) {
+                const record = store.add(
+                  sessionId,
+                  {
+                    text: detail.text ?? '',
+                    tags: [],
+                    anchor: { ...(detail.anchor ?? {}), sessionId: String(sessionId) },
+                  },
+                  readSessionTitle(context, sessionId),
+                );
+                if (detail.tag && record) store.addTag(sessionId, record.id, detail.tag);
+                scheduleMarkers(false);
+              } else if (detail.tag) {
+                store.addTag(sessionId, existing.id, detail.tag);
+              }
+            }
+            const origin = detail.origin || '';
+            const markdown = buildQuote(detail.text ?? '', origin);
+            const outcome = insertIntoComposer(markdown);
+            if (outcome.ok) {
+              answer({ ok: true });
+              return;
+            }
+            // No composer to write into: hand over the text instead of losing it.
+            try {
+              void navigator.clipboard?.writeText(markdown);
+              answer({ ok: true, viaClipboard: true });
+            } catch {
+              answer({ ok: false, reason: 'failed', message: outcome.message });
+            }
+          } catch (error) {
+            console.error('[dsh-pins] 引用处理失败', error);
+            answer({ ok: false, reason: 'failed', message: String(error?.message ?? error) });
+          }
+        };
+        PINS_EVENTS.addEventListener('quote-req', onRequest);
+        return () => PINS_EVENTS.removeEventListener('quote-req', onRequest);
+      }, [insertIntoComposer, sessionId, context]);
+
       // The turn outline is how a jump pages history to a turn that is not loaded:
       // it carries each turn's `turn/start` seq. It arrives through the slot standard
       // kit, so it is published for the frame-wide jump code to use.
@@ -2611,7 +3336,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       React.useEffect(() => {
         const onFilter = (event) => toggleTagFilter(String(event.detail ?? ''));
         const onNotice = (event) => {
-          setNotice(String(event.detail ?? ''));
+          // Notices raised by the bar are shown beside the selection instead; showing
+          // them twice would make both surfaces feel unreliable.
+          if (event.detail?.surface === 'floating') return;
+          setNotice(String(event.detail?.text ?? ''));
           window.setTimeout(() => setNotice(''), 3600);
         };
         PINS_EVENTS.addEventListener('filter', onFilter);
@@ -2677,6 +3405,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const header = h(
         'div',
         { className: 'hd' },
+        tabTypeStatus.state === 'failed'
+          ? h(
+              'div',
+              { className: 'storage-warn' },
+              `右侧栏的标签类型没能注册：${tabTypeStatus.detail || '未知原因'}。固定仍然可用，但面板打不开。`,
+            )
+          : null,
         storage.ok === false ? h('div', { className: 'storage-warn' }, storage.error) : null,
         h(
           'div',
@@ -2715,6 +3450,44 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             'span',
             { className: 'count' },
             mode === 'all' ? `${overviewCount} 条` : `${sessionId ? store.count(sessionId) : 0} 条`,
+          ),
+        ),
+        h(
+          'div',
+          { className: 'tools' },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'tool',
+              title: `${SORT_TITLES[sort]}（点一下换下一种）`,
+              onClick: () => setSort(store.cycleSort()),
+            },
+            h('span', { className: 'tool-icon' }, '⇅'),
+            SORT_LABELS[sort],
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'tool',
+              title: '把当前视图（搜索 + 标签筛选的结果）导出成 markdown 提纲',
+              onClick: () => {
+                const outcome = exportOutline({
+                  mode,
+                  sessionId,
+                  query,
+                  tagFilter,
+                  sort,
+                  sessions: store.sessions(),
+                  list: (id) => store.list(id),
+                  titleOf: (id) => readSessionTitle(context, id),
+                });
+                announce(outcome.message);
+              },
+            },
+            h('span', { className: 'tool-icon' }, '⤓'),
+            '导出',
           ),
         ),
         tags.length > 0
@@ -2845,6 +3618,19 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               current: false,
               taggable: true,
               cardState,
+              onQuote: (target) => {
+                const origin = pinOrigin(target, readSessionTitle(context, sessionId));
+                void requestQuote(
+                  { ...target.anchor, sessionId: String(sessionId) },
+                  target.anchor?.rawQuote ?? target.text ?? '',
+                  origin,
+                  false,
+                ).then((outcome) => {
+                  if (outcome.viaClipboard) announce('没有可用的输入框，已把引用复制到剪贴板');
+                  else if (outcome.ok) announce('已把引用放进输入框');
+                  else announce(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
+                });
+              },
               onTagChange: (action, tag) => {
                 if (action === 'add') {
                   const added = store.addTag(sessionId, pin.id, tag);
@@ -2868,6 +3654,68 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     //#endregion
 
     //#region registration
+
+    /**
+     * Whether the Sidebar's tab type registered, so the panel can say so when it did not.
+     *
+     * Reaching the registry can fail (its provider is installed after this package loads),
+     * and until now that failure lived only in the console: the tab simply never existed
+     * and nothing explained why. The three states are surfaced in the panel instead.
+     */
+    const tabTypeStatus = { state: 'pending', detail: '' };
+
+    /**
+     * The left sidebar's entry to this panel.
+     *
+     * The right column can be closed, and then nothing in the UI reaches the pins: the
+     * only openings were pinning something and a six-second pill after a jump. A left
+     * sidebar entry is persistent, sits where every other panel is reached from, and
+     * works even when the right column was closed by hand.
+     */
+    function PinnedPanelEntry({ context, active }) {
+      const [count, setCount] = React.useState(() => totalPins());
+      const [busy, setBusy] = React.useState(false);
+
+      React.useEffect(() => store.subscribe(() => setCount(totalPins())), []);
+
+      const open = () => {
+        setBusy(true);
+        window.setTimeout(() => setBusy(false), 400);
+        try {
+          context?.get?.('sidebarRight')?.openTab?.(TAB_KIND);
+        } catch (error) {
+          console.error('[dsh-pins] 从左栏打开面板失败', error);
+        }
+      };
+
+      return h(
+        'button',
+        {
+          type: 'button',
+          className: `dsh-pins-panel-entry${active ? ' is-active' : ''}${busy ? ' is-busy' : ''}`,
+          title: count > 0 ? `固定片段（${count} 条）` : '固定片段（还没有）',
+          'aria-label': '固定片段',
+          'aria-pressed': active ? 'true' : 'false',
+          onClick: open,
+        },
+        h(
+          'svg',
+          { viewBox: '0 0 24 24', width: 18, height: 18, 'aria-hidden': true, focusable: 'false' },
+          h('rect', { x: 4, y: 4, width: 12, height: 12, rx: 2.5, fill: 'none', stroke: 'currentColor', strokeWidth: 1.6 }),
+          h('rect', { x: 9, y: 9, width: 11, height: 11, rx: 2.5, fill: 'currentColor', fillOpacity: 0.18, stroke: 'currentColor', strokeWidth: 1.6 }),
+        ),
+        count > 0 ? h('span', { className: 'dsh-pins-panel-count' }, count > 99 ? '99+' : count) : null,
+      );
+    }
+
+    /** Pins across every Session, for the entry's badge. */
+    function totalPins() {
+      try {
+        return store.sessions().reduce((total, [, entry]) => total + (entry.pins?.length ?? 0), 0);
+      } catch {
+        return 0;
+      }
+    }
 
     /**
      * Contain a render failure to this plugin.
@@ -2971,6 +3819,24 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         console.error('[dsh-pins] the slots service is unavailable; the UI cannot register');
       }
 
+      // A persistent way in: the right column can be closed, and then nothing reaches the
+      // pins. The entry sits in the left sidebar's panel row, where every other panel is
+      // opened from, and it is contributed through `slots.inject` so it waits for the
+      // slot to exist rather than assuming load order.
+      if (slots && typeof slots.inject === 'function' && typeof slots.register === 'function') {
+        try {
+          own(
+            slots.inject('sidebar.panellist', () =>
+              slots.register({ name: 'sidebar.panellist', id: PKG, order: 40, label: '固定片段' }, (props) =>
+                h(PinnedPanelEntry, { context, active: props?.active === true }),
+              ),
+            ),
+          );
+        } catch (error) {
+          console.error('[dsh-pins] 左栏入口注册失败', error);
+        }
+      }
+
       // The Sidebar's tab registry is provided after this package loads, so the
       // type registration retries on a short timer instead of holding a hard
       // dependency the browser half cannot express.
@@ -3004,14 +3870,23 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                 keepMounted: true,
               }),
             );
+            tabTypeStatus.state = 'ready';
+            tabTypeStatus.detail = '';
           } catch (error) {
             console.error('[dsh-pins] tab type registration failed', error);
+            tabTypeStatus.state = 'failed';
+            tabTypeStatus.detail = String(error?.message ?? error);
           }
           return;
         }
         attempts += 1;
-        if (attempts < 40) timer = schedule(tryRegister, 250);
-        else console.error('[dsh-pins] sidebarRightTabs never appeared; the panel cannot be opened');
+        if (attempts < 40) {
+          timer = schedule(tryRegister, 250);
+          return;
+        }
+        console.error('[dsh-pins] sidebarRightTabs never appeared; the panel cannot be opened');
+        tabTypeStatus.state = 'failed';
+        tabTypeStatus.detail = '右侧栏的标签注册表始终没有出现（sidebarRightTabs）';
       };
       tryRegister();
 
