@@ -300,6 +300,12 @@ window.__ModuleLoader__.load({
       return false;
     }
 
+    /** Substring match over any short label (a Session title, a tag). */
+    function matchesText(value, query) {
+      if (query === '') return true;
+      return String(value ?? '').toLowerCase().includes(query.toLowerCase());
+    }
+
     /**
      * Rough line count a card needs, so a 1-line pin really renders as one line.
      *
@@ -1657,6 +1663,31 @@ window.__ModuleLoader__.load({
 .dsh-pins-root .group{margin:0 0 2px;padding:6px 6px 2px;font-size:11px;color:var(--dsw-alias-label-tertiary);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsh-pins-root .group span{color:var(--dsw-alias-label-secondary);font-weight:600}
+/* A Session group: its header folds the group, its rows are the pins. */
+.dsh-pins-root .group-block{display:flex;flex-direction:column}
+.dsh-pins-root .group-block>.group{display:flex;align-items:center;gap:6px;white-space:normal;
+  border-radius:7px;padding:6px 6px 6px 4px}
+.dsh-pins-root .group-block>.group:hover{background:var(--dsw-alias-bg-layer-2)}
+.dsh-pins-root .group-fold{flex:none;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;
+  border:none;border-radius:5px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:10px;cursor:pointer}
+.dsh-pins-root .group-fold:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}
+.dsh-pins-root .group-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--dsw-alias-label-secondary);font-weight:600}
+.dsh-pins-root .group-count{flex:none;color:var(--dsw-alias-label-tertiary);font-weight:400}
+.dsh-pins-root .group-block.is-pulse{animation:dsh-pins-group-pulse 1.4s ease-out}
+@keyframes dsh-pins-group-pulse{
+  0%{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 18%,transparent)}
+  100%{background:transparent}}
+/* Name hits: conversations the search matched, kept visually distinct from pin cards. */
+.dsh-pins-root .namehits{display:flex;flex-direction:column;gap:3px;margin:0 6px 10px;padding:6px;
+  border:1px dashed var(--dsw-alias-border-l2);border-radius:8px}
+.dsh-pins-root .namehits-head{font-size:10px;color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-root .namehit{display:flex;align-items:center;gap:6px;min-width:0;padding:4px 6px;border:none;border-radius:6px;
+  background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;text-align:left;cursor:pointer}
+.dsh-pins-root .namehit:hover{background:var(--dsw-alias-bg-layer-2)}
+.dsh-pins-root .namehit-tag{flex:none;padding:1px 5px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);
+  color:var(--dsw-alias-label-tertiary);font-size:9px}
+.dsh-pins-root .namehit-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsh-pins-card{position:relative;box-sizing:border-box;width:100%;margin:0 0 6px;padding:8px 9px 7px;
   border:1px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-layer-1);
   text-align:left;font:inherit;color:inherit;cursor:pointer}
@@ -3120,6 +3151,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const [tagFilter, setTagFilter] = React.useState(() => new Set());
       const [notice, setNotice] = React.useState('');
       const [sort, setSort] = React.useState(() => store.getSort());
+      /** Session groups the user folded shut, and the one a search result just revealed. */
+      const [collapsed, setCollapsed] = React.useState(() => new Set());
+      const [pulseId, setPulseId] = React.useState(null);
+      const groupRefs = React.useRef({});
 
       // Which card is expanded, and which expanded card is in its tag editor. Two
       // ids rather than one "state" so the editor survives a re-render of the list.
@@ -3378,14 +3413,41 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       }, [sessionId, query, matchesTags, tick]);
 
       // The overview honours the same filters as the per-Session list: search and
-      // tag both narrow it, and the counts shown are the surviving ones.
+      // tag both narrow it, and the counts shown are the surviving ones. The rows inside
+      // each group follow the chosen order, so the 「⇅」 button means something here too.
       const overview = React.useMemo(() => {
         if (mode !== 'all') return [];
         return store
           .sessions()
-          .map(([id, entry]) => [id, entry, entry.pins.filter((pin) => matchesQuery(pin, query) && matchesTags(pin))])
+          .map(([id, entry]) => [
+            id,
+            entry,
+            sortPins(
+              entry.pins.filter((pin) => matchesQuery(pin, query) && matchesTags(pin)),
+              sort,
+            ),
+          ])
           .filter(([, , pins]) => pins.length > 0);
-      }, [mode, query, matchesTags, tick]);
+      }, [mode, query, matchesTags, sort, tick]);
+
+      /**
+       * Sessions whose *name* matches the search.
+       *
+       * A name is not a pin, so a name hit never claims a pin matched; the row says
+       * plainly that it is a conversation. In the overview scope every Session is
+       * eligible; in the per-Session view only the others are — your own conversation
+       * needs no pointer, and a row that jumps to where you already are is noise.
+       */
+      const nameMatches = React.useMemo(() => {
+        if (query === '') return [];
+        const found = [];
+        for (const [id, entry] of store.sessions()) {
+          if (mode !== 'all' && id === sessionId) continue;
+          const title = readSessionTitle(context, id) || entry?.title || '';
+          if (title.trim() !== '' && matchesText(title, query)) found.push({ id, title: title.trim() });
+        }
+        return found.slice(0, 12);
+      }, [mode, sessionId, query, tick, context]);
 
       const overviewCount = React.useMemo(
         () => overview.reduce((total, [, , pins]) => total + pins.length, 0),
@@ -3396,6 +3458,41 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         setMode(next);
         store.setMode(next);
       };
+
+      /**
+       * Bring one Session's group into view inside the panel.
+       *
+       * This is deliberately *not* a Session switch. Clicking a name in the search results
+       * is a request to look at that group here — to pin something in it or fix its tags —
+       * and dragging the user out of the conversation they are reading would be a
+       * different, more disruptive action than they asked for. So the panel widens to the
+       * overview and scrolls; the main column never moves.
+       */
+      const revealSession = React.useCallback(
+        (id) => {
+          if (!id) return;
+          setMode('all');
+          store.setMode('all');
+          const scroll = (frames) => {
+            const node = groupRefs.current[id];
+            if (!node) {
+              if (frames > 0) window.requestAnimationFrame(() => scroll(frames - 1));
+              return;
+            }
+            try {
+              const scroller = node.closest('.dsh-pins-root .scroll');
+              scroller?.scrollTo({ top: Math.max(0, node.offsetTop - 8), behavior: 'smooth' });
+            } catch {
+              /* a missing scroller just means the group is already visible */
+            }
+            setPulseId(id);
+            window.setTimeout(() => setPulseId((current) => (current === id ? null : current)), 1500);
+          };
+          // The list has to exist before its geometry does: switch scope, then measure.
+          window.requestAnimationFrame(() => scroll(6));
+        },
+        [],
+      );
 
       // A failed write leaves the panel saying so until a write succeeds: state in
       // memory looks perfectly healthy, so silence here is the difference between a
@@ -3553,43 +3650,111 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         notice !== '' ? h('div', { className: 'note' }, notice) : null,
       );
 
+      // Sessions shown as their own groups, with the order the user chose inside each.
+      const sessionGroups = React.useMemo(() => {
+        if (mode !== 'all') return [];
+        return overview.map(([id, entry, pins]) => [
+          id,
+          { title: sessionLabel({ ...entry, liveTitle: readSessionTitle(context, id) }), pins, collapsed: collapsed.has(id) },
+        ]);
+      }, [mode, overview, collapsed, context]);
+
+      const fold = (id) =>
+        setCollapsed((current) => {
+          const next = new Set(current);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        });
+
+      /** Name hits, listed above the pins and marked as conversations rather than pins. */
+      const namesSection =
+        nameMatches.length > 0
+          ? h(
+              'div',
+              { className: 'namehits' },
+              h('div', { className: 'namehits-head' }, `${nameMatches.length} 个会话名命中`),
+              nameMatches.map((match) =>
+                h(
+                  'button',
+                  {
+                    key: match.id,
+                    type: 'button',
+                    className: 'namehit',
+                    title: '在面板里跳到这个会话的分组（不切换你当前所在的会话）',
+                    onClick: () => revealSession(match.id),
+                  },
+                  h('span', { className: 'namehit-tag' }, '会话名'),
+                  h('span', { className: 'namehit-text' }, match.title),
+                ),
+              ),
+            )
+          : null;
+
       let body;
 
       if (mode === 'all') {
         body =
-          overview.length === 0
+          overview.length === 0 && nameMatches.length === 0
             ? h(
                 'div',
                 { className: 'empty' },
-                h('b', null, '还没有固定任何片段'),
-                '在对话里划选一段文字，点浮出来的「固定」。',
+                h('b', null, query !== '' ? '没有匹配的固定片段' : '还没有固定任何片段'),
+                query !== '' ? '换个关键词，或者清掉搜索。' : '在对话里划选一段文字，点浮出来的「固定」。',
               )
             : h(
                 'div',
                 { className: 'scroll', onScroll: () => cardState.scrollQuiet() },
-                overview.map(([id, entry, pins]) =>
+                namesSection,
+                sessionGroups.map(([id, group]) =>
                   h(
                     'div',
-                    { key: id },
-                    h('div', { className: 'group' }, h('span', null, sessionLabel({ ...entry, liveTitle: readSessionTitle(context, id) })), ` · ${pins.length}`),
-                    pins.map((pin) =>
-                      h(PinCard, {
-                        key: pin.id,
-                        sessionId: id,
-                        pin,
-                        current: isCurrent && id === sessionId,
-                        taggable: false,
-                        cardState,
-                        // The overview is for reading; a card there does not edit tags,
-                        // and the panel-level manager above it is how one is removed.
-                        onTagChange: () => false,
-                        context,
-                      }),
+                    {
+                      key: id,
+                      className: `group-block${pulseId === id ? ' is-pulse' : ''}`,
+                      'data-session': id,
+                      ref: (node) => {
+                        if (node) groupRefs.current[id] = node;
+                        else delete groupRefs.current[id];
+                      },
+                    },
+                    h(
+                      'div',
+                      { className: 'group' },
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'group-fold',
+                          'aria-expanded': group.collapsed ? 'false' : 'true',
+                          title: group.collapsed ? '展开这个会话的片段' : '收起这个会话的片段',
+                          onClick: () => fold(id),
+                        },
+                        group.collapsed ? '▸' : '▾',
+                      ),
+                      h('span', { className: 'group-name' }, group.title),
+                      h('span', { className: 'group-count' }, `${group.pins.length} 条`),
                     ),
+                    group.collapsed
+                      ? null
+                      : group.pins.map((pin) =>
+                          h(PinCard, {
+                            key: pin.id,
+                            sessionId: id,
+                            pin,
+                            current: isCurrent && id === sessionId,
+                            taggable: false,
+                            cardState,
+                            // The overview is for reading; a card there does not edit tags,
+                            // and the panel-level manager above it is how one is removed.
+                            onTagChange: () => false,
+                            context,
+                          }),
+                        ),
                   ),
                 ),
               );
-      } else if (visible.length === 0) {
+      } else if (visible.length === 0 && nameMatches.length === 0) {
         body = h(
           'div',
           { className: 'empty' },
@@ -3610,6 +3775,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         body = h(
           'div',
           { className: 'scroll', onScroll: () => cardState.scrollQuiet() },
+          // The same name search as the overview, minus your own conversation.
+          namesSection,
           visible.map((pin) =>
             h(PinCard, {
               key: pin.id,
