@@ -78,19 +78,76 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * A message's position inside its turn, corrected for the loaded window.
+     *
+     * The position recorded at pin time is an index among the turn's rows *as loaded
+     * then*. Paging older history in shifts every row down, so two pins made on either
+     * side of a paging boundary were measured on different scales and compared as if
+     * they were the same — which is how a passage pinned earlier could sort after a
+     * later one.
+     *
+     * The correction is a high-water mark per message: a message's index may only ever
+     * grow, and once a message has been seen at index 7 it stays at 7 even though it
+     * later renders at 12. New messages, which appear later in the conversation, get
+     * fresh indices that are larger; messages loaded in front of them keep their old
+     * ones, which is exactly the order they have in the conversation.
+     */
+    const stableMsgOrder = new Map();
+    const STABLE_ORDER_KEY = 'dsh-pins/msg-order';
+
+    function loadStableMsgOrder() {
+      const saved = readJson(STABLE_ORDER_KEY, null);
+      if (!saved || typeof saved !== 'object') return;
+      for (const [key, value] of Object.entries(saved)) {
+        if (typeof value === 'number' && Number.isFinite(value)) stableMsgOrder.set(key, value);
+      }
+    }
+
+    function saveStableMsgOrder() {
+      const plain = {};
+      for (const [key, value] of stableMsgOrder) plain[key] = value;
+      writeJson(STABLE_ORDER_KEY, plain);
+    }
+
+    /**
+     * The stable index of one message, given where it renders now.
+     *
+     * @param key - the message's stable Conversation key.
+     * @param turn - its turn number, part of the identity because indices restart per turn.
+     * @param observed - its index among the turn's rows right now.
+     * @returns the corrected index, never smaller than one seen before.
+     */
+    function stableOrderFor(key, turn, observed) {
+      if (typeof key !== 'string' || key === '') return observed;
+      const mapKey = `${turn}:${key}`;
+      const known = stableMsgOrder.get(mapKey);
+      if (known === undefined) {
+        stableMsgOrder.set(mapKey, observed);
+        saveStableMsgOrder();
+        return observed;
+      }
+      if (observed > known) return known;
+      return observed;
+    }
+
+    /**
      * Order one Session's pins.
      *
      * The context comparison is total on purpose: turn, then the position inside the
-     * message, then the offset within the message, then a stable tie-break. Pins made
-     * before part of that existed simply compare equal on the missing part and fall
-     * through to the next key, so no pin is ever dropped or reordered at random.
+     * turn, then the offset within the message, then a stable tie-break. Pins made before
+     * part of that existed compare equal on the missing key and fall through to the next
+     * one, so no pin is ever dropped or reordered at random.
      */
     function sortPins(pins, sort) {
       const mode = normalizeSort(sort);
+      const contextOrder = (pin) =>
+        typeof pin.anchor?.msgKey === 'string' && pin.anchor.msgKey !== ''
+          ? stableOrderFor(pin.anchor.msgKey, pin.anchor.turn ?? 0, pin.anchor.msgOrder ?? 0)
+          : (pin.anchor?.msgOrder ?? 0);
       const byContext = (a, b) => {
         const turnDelta = (a.anchor?.turn ?? 0) - (b.anchor?.turn ?? 0);
         if (turnDelta !== 0) return turnDelta;
-        const msgDelta = (a.anchor?.msgOrder ?? 0) - (b.anchor?.msgOrder ?? 0);
+        const msgDelta = contextOrder(a) - contextOrder(b);
         if (msgDelta !== 0) return msgDelta;
         const offsetDelta = (a.anchor?.rawOffset ?? -1) - (b.anchor?.rawOffset ?? -1);
         if (offsetDelta !== 0) return offsetDelta;
@@ -110,6 +167,8 @@ window.__ModuleLoader__.load({
       else ordered.sort((a, b) => byTime(b, a));
       return ordered;
     }
+
+    loadStableMsgOrder();
 
     //#endregion
 
@@ -740,6 +799,11 @@ window.__ModuleLoader__.load({
       }
 
       const singleBlock = blockKindOf(startElement) === blockKindOf(endElement) ? blockKindOf(startElement) : 'prose';
+      // Where this message sits inside its turn, so context order has a key that works
+      // across every message kind. Read from the rows, because the engine's own ordering
+      // key is an opaque namespace; `msgKey` is carried along so the index can be
+      // corrected against a window that may have grown since an earlier pin.
+      const placement = messageOrderInTurn(source);
 
       // Whether the selection is only part of its block: a fact only observable at
       // pin time, and the one the renderer needs to say "this is a fragment".
@@ -773,7 +837,8 @@ window.__ModuleLoader__.load({
           // Where this message sits inside its turn, so context order has a key that
           // works across every message kind. Read from the rows, because the engine's
           // own ordering key is an opaque namespace.
-          msgOrder: messageOrderInTurn(source),
+          msgOrder: placement.order,
+          msgKey: placement.key,
           block: singleBlock,
           lang: singleBlock === 'code' ? codeLanguageOf(startElement) : '',
           partial,
@@ -814,9 +879,11 @@ window.__ModuleLoader__.load({
         const at = rows.findIndex(
           (row) => (row.getAttribute('data-chat-flow-key') ?? row.getAttribute('data-chat-node-key')) === key,
         );
-        return at >= 0 ? at : 0;
+        // The index is corrected against the high-water mark in `stableOrderFor`, so a
+        // window that grew since an earlier pin cannot reorder the two.
+        return { order: at >= 0 ? at : 0, key: typeof key === 'string' ? key : '' };
       } catch {
-        return 0;
+        return { order: 0, key: '' };
       }
     }
 
@@ -1400,6 +1467,7 @@ window.__ModuleLoader__.load({
      * Conversation's own jump logic reads.
      */
     function findFlowRow(flowKey) {
+      if (typeof flowKey !== 'string' || flowKey === '') return null;
       try {
         for (const candidate of document.querySelectorAll('[data-chat-flow-key],[data-chat-anchor-key]')) {
           if (
@@ -1415,12 +1483,56 @@ window.__ModuleLoader__.load({
       return null;
     }
 
-    /** The conversation's own scrollport; the frame is `overflow:hidden`, so this is the only thing that scrolls. */
+    /**
+     * The row for one pin, with a fallback that does not depend on the key format.
+     *
+     * The anchor key is an undocumented engine string, and the whole anchoring scheme
+     * rests on it. That is acceptable as the primary path — it is exact and cheap — but
+     * not as the only one: the placement recorded when the passage was pinned (its turn
+     * plus its ordinal among that turn's rows) survives the key being renamed, and it is
+     * the same fact the ordering already relies on. The fallback is only consulted when
+     * the key lookup misses inside a turn that *is* loaded, so it cannot send a jump to
+     * an unrelated row in a different turn.
+     *
+     * @returns `{ row, via }` with `via` naming which anchor answered.
+     */
+    function resolveRow(pin) {
+      const byKey = findFlowRow(pin?.anchor?.flowKey);
+      if (byKey) return { row: byKey, via: 'key' };
+      const turn = pin?.anchor?.turn;
+      const order = pin?.anchor?.msgOrder;
+      if (!Number.isFinite(turn) || !Number.isFinite(order)) return { row: null, via: 'none' };
+      try {
+        const rows = [...document.querySelectorAll('[data-chat-flow-key][data-chat-turn]')].filter(
+          (row) => Number(row.getAttribute('data-chat-turn')) === turn,
+        );
+        // Only inside a turn that has rows on screen: an unloaded turn needs paging, which
+        // the caller does by seq, not by counting.
+        if (rows.length === 0) return { row: null, via: 'none' };
+        const row = rows[order] ?? null;
+        if (row) console.warn('[dsh-pins] 锚点 key 没有命中，改按位置定位', { turn, order });
+        return { row, via: row ? 'placement' : 'none' };
+      } catch {
+        return { row: null, via: 'none' };
+      }
+    }
+
+    /**
+     * The conversation's own scrollport; the frame is `overflow:hidden`, so this is the
+     * only thing that scrolls.
+     *
+     * The attribute is the contract, but a renamed attribute must degrade rather than
+     * break, so there is a heuristic behind it. The heuristic excludes this plugin's own
+     * panel: an expanded card makes the panel's list the tallest scrollable element on
+     * the page, and picking it would scroll the right column while claiming to move the
+     * conversation.
+     */
     function findScroller() {
       const fromAttribute = document.querySelector('[data-conversation-scroll]');
       if (fromAttribute) return fromAttribute;
       let best = null;
       for (const element of document.querySelectorAll('div')) {
+        if (element.closest('[data-dsh-pins]')) continue;
         if (element.scrollHeight - element.clientHeight < 40) continue;
         if (getComputedStyle(element).overflowY !== 'auto' && getComputedStyle(element).overflowY !== 'scroll') continue;
         if (best === null || element.scrollHeight > best.scrollHeight) best = element;
@@ -1575,7 +1687,8 @@ window.__ModuleLoader__.load({
       const flowKey = pin?.anchor?.flowKey;
       if (typeof flowKey !== 'string' || flowKey === '') return 'missing';
 
-      const row = findFlowRow(flowKey);
+      const resolved = resolveRow(pin);
+      const row = resolved.row;
       if (!row) {
         // Not mounted: it may be below the loaded window (history paginates
         // upwards) or inside a collapsed process disclosure. Page once and try
@@ -1585,7 +1698,7 @@ window.__ModuleLoader__.load({
           let frames = 0;
           const retry = () => {
             frames += 1;
-            const late = findFlowRow(flowKey);
+            const late = resolveRow(pin).row;
             if (late) {
               const lateLocated = locateQuote(late, pin, false);
               scrollToRange(lateLocated.range) || scrollToRow(late);
@@ -1674,10 +1787,18 @@ window.__ModuleLoader__.load({
 .dsh-pins-root .group-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   color:var(--dsw-alias-label-secondary);font-weight:600}
 .dsh-pins-root .group-count{flex:none;color:var(--dsw-alias-label-tertiary);font-weight:400}
+.dsh-pins-root .group-why{flex:none;padding:1px 5px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);
+  color:var(--dsw-alias-label-tertiary);font-size:9px;font-weight:400}
 .dsh-pins-root .group-block.is-pulse{animation:dsh-pins-group-pulse 1.4s ease-out}
 @keyframes dsh-pins-group-pulse{
   0%{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 18%,transparent)}
   100%{background:transparent}}
+/* One card, when a chip in the composer asked for the passage it was made from. */
+.dsh-pins-root .dsh-pins-card.is-pulse{animation:dsh-pins-card-pulse 1.6s ease-out}
+@keyframes dsh-pins-card-pulse{
+  0%{border-color:var(--dsw-alias-brand-primary);
+     background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,transparent)}
+  100%{border-color:var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}}
 /* Name hits: conversations the search matched, kept visually distinct from pin cards. */
 .dsh-pins-root .namehits{display:flex;flex-direction:column;gap:3px;margin:0 6px 10px;padding:6px;
   border:1px dashed var(--dsw-alias-border-l2);border-radius:8px}
@@ -2778,7 +2899,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      */
     function buildQuote(text, origin) {
       const body = quoteBlock(text);
-      return origin ? `> ${origin}\n${body}` : body;
+      const block = origin ? `> ${origin}\n${body}` : body;
+      // A trailing newline, so the caret that lands after an inserted quote sits on a fresh
+      // line. Without it the user's own words continue the quote's last line and read as
+      // part of the quoted passage — caught on the first end-to-end chip test, where
+      // 「测试，回复你看到的」 came through inside the blockquote. The send path trims the
+      // whole draft, so this never reaches the model.
+      return `${block}\n`;
     }
 
     /**
@@ -2817,6 +2944,279 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#endregion
 
+    //#region reference chips in the composer
+
+    /**
+     * The pinned passages, offered inside the composer's own `@` menu.
+     *
+     * A chip is a pointer: the editor keeps `ref`, and the submit attempt asks the owning
+     * source to turn that pointer into the text the model reads. That is the one place
+     * this plugin is allowed to decide what the model sees, so the decision is made once
+     * and every projection is derived from it.
+     *
+     * Why the passage itself rides inside `ref` instead of naming a pin id:
+     *
+     * - Resolution cannot fail. A codec that rejects makes the submit attempt refuse the
+     *   whole message and restore the draft; a codec with nothing to look up cannot
+     *   reject. Deleting the pinned passage after inserting the chip therefore changes
+     *   nothing about the message, and no message is ever blocked by this plugin.
+     * - The passage survives a reload. The composer's persisted draft is the clipboard
+     *   projection, so a reloaded chip comes back as plain text; with `clipboardText` set
+     *   to the same string the codec produces, that degradation is byte-identical to the
+     *   expansion and the user cannot tell the difference.
+     *
+     * The cost is an honest one: the reference is as long as the passage. It lives in the
+     * editor's node, is never persisted, and is never shown.
+     */
+    const PIN_SOURCE_NAME = 'pins';
+    /** The `ref` prefix, and the guard that keeps another source's references out. */
+    const CHIP_REF_PREFIX = 'pins:';
+    /** The level-two scope. Typed after `@`, everything past the prefix filters. */
+    const CHIP_SCOPE = '固定片段';
+    const CHIP_SCOPE_PREFIX = `${CHIP_SCOPE}/`;
+    /** Replacing the whole trigger token with this reopens the menu one level in. */
+    const CHIP_SCOPE_TOKEN = `@${CHIP_SCOPE_PREFIX}`;
+    /** The level-one row's opaque payload: a constant, so it cannot collide with an id. */
+    const CHIP_ROOT_VALUE = 'root';
+
+    /**
+     * A reference payload: the pin id on the first line, the finished passage below it.
+     *
+     * The id is only there for click-to-reveal; the passage is the payload. Splitting on
+     * one newline keeps the whole thing readable in a debugger, which a base64 envelope
+     * would not be.
+     */
+    function encodeChipRef(pinId, text) {
+      return `${CHIP_REF_PREFIX}${pinId}\n${text}`;
+    }
+
+    /** @returns `{ pinId, text }`, or null when the reference is not one of ours. */
+    function decodeChipRef(ref) {
+      if (typeof ref !== 'string' || !ref.startsWith(CHIP_REF_PREFIX)) return null;
+      const body = ref.slice(CHIP_REF_PREFIX.length);
+      const at = body.indexOf('\n');
+      if (at <= 0) return null;
+      return { pinId: body.slice(0, at), text: body.slice(at + 1) };
+    }
+
+    /** A one-line handle for a passage: the menu row and the chip label both use it. */
+    function chipShort(pin) {
+      const source = pin?.anchor?.rawQuote ?? pin?.text ?? '';
+      const first = String(source)
+        .split('\n')
+        .find((line) => line.trim() !== '');
+      const flat = (first ?? '').trim().replace(/\s+/g, ' ');
+      if (flat === '') return '（空白片段）';
+      return flat.length > 14 ? `${flat.slice(0, 14)}…` : flat;
+    }
+
+    /** Where a chip's passage came from, in the same words the 引用 button uses. */
+    function chipRowMeta(pin) {
+      const tags = Array.isArray(pin?.tags) ? pin.tags : [];
+      const bits = [];
+      // Two tags, then a count. One passage here carries thirteen, and listing them all
+      // turned the right-aligned column into a single smear that shoved the row's own name
+      // out of the way. The count keeps the fact that more exist without spending the row.
+      for (const tag of tags.slice(0, 2)) bits.push(`#${tag}`);
+      if (tags.length > 2) bits.push(`+${tags.length - 2}`);
+      if (pin?.anchor?.turn) bits.push(`第 ${pin.anchor.turn} 轮`);
+      bits.push(sourceLabel(pin));
+      return bits.join(' · ');
+    }
+
+    /**
+     * The level-two rows one query selects, in the panel's own sort order.
+     *
+     * Shared by the candidate list and the header so the count in the crumb and the rows
+     * below it can never disagree about what matched.
+     */
+    function chipMatches(pins, needle) {
+      if (needle === '') return pins;
+      return pins.filter((pin) => matchesQuery(pin, needle) || matchesText(chipShort(pin), needle));
+    }
+
+    /** The text a chip stands for: identical to the codec's answer and the clipboard form. */
+    function chipText(pin, title) {
+      return buildQuote(pin?.anchor?.rawQuote ?? pin?.text ?? '', pinOrigin(pin, title));
+    }
+
+    /**
+     * The `@` trigger source.
+     *
+     * Two levels, both reached by an ordinary pick:
+     *
+     * 1. one row naming the scope. Picking it replaces the token with the scope prefix,
+     *    and the trailing slash reopens the menu one level in.
+     * 2. the passages of this conversation, filtered by whatever is typed after the
+     *    prefix — the live query *is* the search box, so this needs no UI of its own.
+     *
+     * A settling pick rather than `drill: true` is deliberate. A drill row renders the
+     * pipeline's own chevron and its own localized hint ("进入目录"), which describes a
+     * directory descent and not this; worse, a row without the flag descends on a plain
+     * mouse click, on Tab and on Enter alike, which is what a user reaching for a passage
+     * actually tries first.
+     *
+     * @param deps - `titleOf(sessionId)` and `openPanel()`, both owned by `apply`.
+     */
+    function createPinsTriggerSource(deps) {
+      const sessionIdOf = (session) => {
+        const id = session?.sessionId;
+        return id === undefined || id === null ? '' : String(id);
+      };
+
+      return {
+        trigger: '@',
+        name: PIN_SOURCE_NAME,
+        // First in the menu. It sat at the bottom first, on the theory that a plugin should
+        // not take the top slot — and the user who asked for the feature could not find it.
+        // A row the person who wanted it cannot find has already lost that argument.
+        //
+        // The cost, stated rather than discovered: the pipeline highlights the first ready
+        // group's first row, so a fresh `@` has this row highlighted and Enter descends into
+        // the passages instead of picking the first recent file. The row only exists while
+        // the query is empty or names this scope, so any other query removes it and file and
+        // Session search behave exactly as before.
+        order: -5,
+        // The group title is the source name run through the pipeline's own dictionary,
+        // and a borrowed key would either miss or translate as something else. A section
+        // heading owned by this source says the same thing in its own words.
+        showGroupTitle: false,
+
+        async candidates(session, req) {
+          const sessionId = sessionIdOf(session);
+          if (sessionId === '') return [];
+          const pins = store.list(sessionId);
+          const query = String(req?.query ?? '');
+
+          // Level two. The prefix decides, never the drill flag: typing the scope by hand
+          // has to land in exactly the same place as descending into it.
+          if (query.startsWith(CHIP_SCOPE_PREFIX)) {
+            const needle = query.slice(CHIP_SCOPE_PREFIX.length);
+            return chipMatches(pins, needle).map((pin) => {
+              const meta = chipRowMeta(pin);
+              return {
+                name: chipShort(pin),
+                ...(meta === '' ? {} : { description: meta }),
+                value: String(pin.id),
+                // No `section`: the crumb above already names this scope and carries the
+                // count, and a section heading said the same two words a second time.
+              };
+            });
+          }
+
+          // Level one. No passages means no group at all: a row the user can pick while
+          // nothing happens is worse than a menu that simply does not offer it.
+          if (pins.length === 0) return [];
+          const searchable = [CHIP_SCOPE, '固定', '引用', PIN_SOURCE_NAME];
+          if (query !== '' && !searchable.some((key) => matchesText(key, query))) return [];
+          return [
+            {
+              name: CHIP_SCOPE,
+              description: `${pins.length} 条`,
+              value: CHIP_ROOT_VALUE,
+            },
+          ];
+        },
+
+        /**
+         * The level-two crumb: where you are, how much is here, and the way back out.
+         *
+         * It replaced the section heading rather than sitting next to it — the two said
+         * 「固定片段」 one above the other, which is a title, not information. Picking it
+         * replaces the token with a bare `@` and the menu reopens at level one.
+         */
+        header(session, req) {
+          const query = String(req?.query ?? '');
+          if (!query.startsWith(CHIP_SCOPE_PREFIX)) return undefined;
+          const sessionId = sessionIdOf(session);
+          const pins = sessionId === '' ? [] : store.list(sessionId);
+          const needle = query.slice(CHIP_SCOPE_PREFIX.length);
+          const hits = chipMatches(pins, needle).length;
+          const label =
+            hits === pins.length
+              ? `${CHIP_SCOPE} · ${pins.length} 条`
+              : `${CHIP_SCOPE} · ${pins.length} 条 · 命中 ${hits}`;
+          return [{ label, value: CHIP_ROOT_VALUE }];
+        },
+
+        onPick(pick) {
+          const action = pick?.action ?? 'pick';
+          const value = String(pick?.candidate?.value ?? '');
+
+          // A crumb pick is the pipeline's only drill: leave the scope, keep the trigger.
+          if (action === 'drill') return { text: '@', continue: true };
+          // Level one: descend in place. `continue` is a passenger here — the reopened
+          // menu is the pipeline re-tracking the settled caret — but it states the intent.
+          if (value === CHIP_ROOT_VALUE || value === '') return { text: CHIP_SCOPE_TOKEN, continue: true };
+
+          const sessionId = sessionIdOf(pick?.session);
+          const pin = sessionId === '' ? undefined : store.get(sessionId, value);
+          if (!pin) {
+            announce('这条固定片段已经不在列表里了');
+            return undefined;
+          }
+          const text = chipText(pin, deps.titleOf(sessionId));
+          return {
+            insert: {
+              source: PIN_SOURCE_NAME,
+              ref: encodeChipRef(String(pin.id), text),
+              label: `固定 · ${chipShort(pin)}`,
+              // The same string the codec answers with, so the plain text a reloaded draft
+              // degrades to says exactly what the chip would have said.
+              clipboardText: text,
+            },
+          };
+        },
+
+        /**
+         * Neither projection can fail.
+         *
+         * A rejecting codec makes the submit attempt refuse the message and restore the
+         * draft, and this plugin has no business blocking a send: the passage was copied
+         * into the reference when the chip was created, so there is nothing left to look
+         * up and nothing left to go wrong. An unreadable reference is answered with its own
+         * text rather than an exception, which keeps the "never blocks a send" promise even
+         * if the payload format ever changes under it.
+         */
+        codec: {
+          clipboardText: (ref) => decodeChipRef(ref)?.text ?? '',
+          serialize: (ref) => {
+            const parsed = decodeChipRef(ref);
+            if (parsed) return Promise.resolve(parsed.text);
+            console.warn('[dsh-pins] 引用芯片的载荷读不出来，按原样送出', ref);
+            return Promise.resolve(String(ref ?? ''));
+          },
+        },
+
+        /**
+         * Clicking a chip asks for the passage it was made from.
+         *
+         * This is the gesture that opens an `@file` chip's preview, so it opens the panel
+         * and pulses that one card. A passage the user has since deleted is not an error
+         * worth a dialog: the message still carries its text, and saying so is the whole
+         * answer.
+         */
+        openReference(session, reference) {
+          const parsed = decodeChipRef(reference?.ref);
+          if (!parsed) return false;
+          const problem = deps.openPanel();
+          if (problem !== '') {
+            announce(`打不开固定片段面板：${problem}`);
+            return true;
+          }
+          const sessionId = sessionIdOf(session);
+          if (!store.get(sessionId, parsed.pinId)) {
+            announce('这条固定片段已被删除；引用内容还在输入框里，照常可以发送');
+            return true;
+          }
+          PINS_EVENTS.dispatchEvent(new CustomEvent('chip-reveal', { detail: { pinId: parsed.pinId } }));
+          return true;
+        },
+      };
+    }
+
+    //#endregion
+
     //#region sidebar panel
 
     /**
@@ -2836,7 +3236,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * that strip. `padding` would not do this: padding belongs to the scroller, so the
      * wheel would keep scrolling the text.
      */
-    function PinCard({ sessionId, pin, current, taggable, onTagChange, onQuote, context, cardState }) {
+    function PinCard({ sessionId, pin, current, taggable, onTagChange, onQuote, context, cardState, foreign }) {
       const [draft, setDraft] = React.useState('');
       const rootRef = React.useRef(null);
       const open = cardState?.isOpen?.(pin.id) === true;
@@ -2872,6 +3272,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       };
 
       const jump = () => {
+        // A card in 「全部」 can belong to another conversation, whose rows are not in the
+        // DOM at all. "Scroll up to load history" would be advice that cannot work there,
+        // and switching the conversation is the one thing this panel promised not to do.
+        if (foreign) {
+          announce('这条固定片段属于另一个对话，在这里点它不会切换对话；想跳回原文请先切到那个对话。');
+          return;
+        }
         let verdict = 'missing';
         try {
           verdict = jumpToPin(pin, context);
@@ -2879,9 +3286,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           console.error('[dsh-pins] 跳回原文失败', error);
         }
         if (verdict === 'missing') {
-          PINS_EVENTS.dispatchEvent(
-            new CustomEvent('notice', { detail: '这条消息还没加载进当前窗口：先向上滚动加载历史，再点一次。' }),
-          );
+          // Through `announce`, not as a bare string in the event detail: the panel reads
+          // `detail.text`, so the string form produced an **empty** notice — the click did
+          // nothing and said nothing, which is the one outcome this path must not have.
+          announce('这条消息还没加载进当前窗口：先向上滚动加载历史，再点一次。');
           return;
         }
         PINS_EVENTS.dispatchEvent(new Event('jump'));
@@ -2996,6 +3404,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           ref: rootRef,
           'data-dsh-pins': '',
           className: 'dsh-pins-card',
+          // How a chip in the composer finds this exact card again; the click-to-reveal
+          // pulse is applied to this node rather than through render state.
+          'data-pin-id': pin.id,
           'data-kind': pin.anchor?.kind ?? '',
           'data-block': pin.anchor?.block ?? 'prose',
           'data-truncated': pin.anchor?.partial === true || fullText.length > 600 ? '' : undefined,
@@ -3322,6 +3733,104 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         return () => PINS_EVENTS.removeEventListener('quote-req', onRequest);
       }, [insertIntoComposer, sessionId, context]);
 
+      // A chip in the composer asked for the passage it was made from.
+      //
+      // The pulse and the scroll are applied to the card's own DOM node rather than through
+      // render state: this is one decoration with a lifetime of one animation, and putting
+      // it in state would add a prop to every card in both views for it. React only rewrites
+      // `className` when that prop changes, and it is a constant, so the class survives the
+      // re-renders a hover would cause.
+      React.useEffect(() => {
+        const onReveal = (event) => {
+          const pinId = String(event.detail?.pinId ?? '');
+          if (pinId === '') return;
+          let node = null;
+          for (const candidate of document.querySelectorAll('.dsh-pins-card')) {
+            if (candidate.getAttribute('data-pin-id') === pinId) {
+              node = candidate;
+              break;
+            }
+          }
+          if (!node) {
+            // Found by identity, not by luck: say why it is not on screen instead of
+            // scrolling somewhere else and calling it a jump.
+            announce('这条固定片段不在当前列表里（可能被搜索、标签筛选或折叠挡住了）');
+            return;
+          }
+          let scroller = node.parentElement;
+          while (scroller) {
+            if (scroller.scrollHeight - scroller.clientHeight > 8) {
+              const overflowY = window.getComputedStyle(scroller).overflowY;
+              if (overflowY === 'auto' || overflowY === 'scroll') break;
+            }
+            scroller = scroller.parentElement;
+          }
+          if (scroller) {
+            const top =
+              scroller.scrollTop +
+              (node.getBoundingClientRect().top - scroller.getBoundingClientRect().top) -
+              8;
+            try {
+              scroller.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+            } catch {
+              scroller.scrollTop = Math.max(0, top);
+            }
+          }
+          node.classList.add('is-pulse');
+          window.setTimeout(() => node.classList.remove('is-pulse'), 1600);
+        };
+        PINS_EVENTS.addEventListener('chip-reveal', onReveal);
+        return () => PINS_EVENTS.removeEventListener('chip-reveal', onReveal);
+      }, []);
+
+      /**
+       * Put one passage into the composer, from whichever view the card was in.
+       *
+       * The quote lands in the conversation currently on screen — that is the only composer
+       * the panel can reach — while the origin line names the passage's **own** conversation,
+       * so a quote taken from 「全部」 stays traceable to where it came from.
+       */
+      const quotePin = React.useCallback(
+        (target, ownerSessionId) => {
+          const owner = String(ownerSessionId ?? sessionId ?? '');
+          const origin = pinOrigin(target, readSessionTitle(context, owner));
+          void requestQuote(
+            { ...target.anchor, sessionId: owner },
+            target.anchor?.rawQuote ?? target.text ?? '',
+            origin,
+            false,
+          ).then((outcome) => {
+            if (outcome.viaClipboard) announce('没有可用的输入框，已把引用复制到剪贴板');
+            else if (outcome.ok) announce('已把引用放进输入框');
+            else announce(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
+          });
+        },
+        [context, sessionId],
+      );
+
+      /**
+       * Tag edits from either view, addressed to the passage's own conversation.
+       *
+       * 「全部」 used to hand every card `() => false`, and that did not make the cards
+       * read-only — the tag editor still opened on a click. It only made every edit fail:
+       * adding a tag answered 「已经有 #x 这个标签了」 for a tag the passage never had. A
+       * control that opens and then lies is worse than one that is absent.
+       */
+      const changeTag = React.useCallback(
+        (target, ownerSessionId, action, tag) => {
+          const owner = String(ownerSessionId ?? sessionId ?? '');
+          if (action === 'add') {
+            const added = store.addTag(owner, target.id, tag);
+            if (added) announce(`已加标签 #${tag}`);
+            return added;
+          }
+          const removed = store.removeTag(owner, target.id, tag);
+          if (removed) announce(`已删除标签 #${tag}`);
+          return removed;
+        },
+        [sessionId],
+      );
+
       // The turn outline is how a jump pages history to a turn that is not loaded:
       // it carries each turn's `turn/start` seq. It arrives through the slot standard
       // kit, so it is published for the frame-wide jump code to use.
@@ -3374,7 +3883,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // Notices raised by the bar are shown beside the selection instead; showing
           // them twice would make both surfaces feel unreliable.
           if (event.detail?.surface === 'floating') return;
-          setNotice(String(event.detail?.text ?? ''));
+          // A bare string is accepted too: one dispatch site used `detail: '...'`, and the
+          // `detail.text` read turned it into an empty notice, so the click said nothing
+          // at all. Tolerating both shapes means that class of mistake can only ever be
+          // wordy, never silent.
+          const detail = event.detail;
+          setNotice(typeof detail === 'string' ? detail : String(detail?.text ?? ''));
           window.setTimeout(() => setNotice(''), 3600);
         };
         PINS_EVENTS.addEventListener('filter', onFilter);
@@ -3433,21 +3947,46 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       /**
        * Sessions whose *name* matches the search.
        *
+       * Only the overview searches names. The per-Session view once listed other
+       * conversations' names while still showing only its own pins, which is a promise
+       * the view cannot keep: if a name is reachable there, its contents should be too,
+       * and once it lists everything it *is* the overview. Each view therefore owns one
+       * job — this one manages this conversation, that one manages all of them — and the
+       * search box follows the same rule.
+       *
        * A name is not a pin, so a name hit never claims a pin matched; the row says
-       * plainly that it is a conversation. In the overview scope every Session is
-       * eligible; in the per-Session view only the others are — your own conversation
-       * needs no pointer, and a row that jumps to where you already are is noise.
+       * plainly that it is a conversation.
        */
       const nameMatches = React.useMemo(() => {
-        if (query === '') return [];
+        if (mode !== 'all' || query === '') return [];
         const found = [];
         for (const [id, entry] of store.sessions()) {
-          if (mode !== 'all' && id === sessionId) continue;
           const title = readSessionTitle(context, id) || entry?.title || '';
           if (title.trim() !== '' && matchesText(title, query)) found.push({ id, title: title.trim() });
         }
         return found.slice(0, 12);
-      }, [mode, sessionId, query, tick, context]);
+      }, [mode, query, tick, context]);
+
+      /**
+       * Sessions whose *name* matched, kept as their own groups.
+       *
+       * Without this a name hit led nowhere: the groups are built from the pins the search
+       * matched, so a conversation whose name matched had every pin filtered out and the
+       * group was never rendered — the jump scrolled to something that did not exist. A
+       * name match therefore keeps the whole Session, and the group says why it is there.
+       */
+      const nameHitGroups = React.useMemo(() => {
+        if (mode !== 'all' || nameMatches.length === 0) return [];
+        const seen = new Set(overview.map(([id]) => id));
+        const groups = [];
+        for (const match of nameMatches) {
+          if (seen.has(match.id)) continue;
+          const entry = store.sessions().find(([id]) => id === match.id)?.[1];
+          const pins = sortPins((entry?.pins ?? []).filter(matchesTags), sort);
+          if (pins.length > 0) groups.push([match.id, { title: match.title, pins, byName: true }]);
+        }
+        return groups;
+      }, [mode, nameMatches, overview, matchesTags, sort, tick]);
 
       const overviewCount = React.useMemo(
         () => overview.reduce((total, [, , pins]) => total + pins.length, 0),
@@ -3471,33 +4010,96 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const revealSession = React.useCallback(
         (id) => {
           if (!id) return;
+          const startedIn = mode;
+          console.log('[dsh-pins] 会话名跳转：开始', { id, from: startedIn, rendered: Boolean(groupRefs.current[id]) });
           setMode('all');
           store.setMode('all');
-          const scroll = (frames) => {
+          const scroll = (frames, waited) => {
             const node = groupRefs.current[id];
             if (!node) {
-              if (frames > 0) window.requestAnimationFrame(() => scroll(frames - 1));
+              // The overview has to exist before its geometry does: switch scope, then
+              // measure. The wait is bounded so a group that never renders cannot spin.
+              if (frames > 0) window.requestAnimationFrame(() => scroll(frames - 1, waited + 1));
+              else console.error('[dsh-pins] 会话名跳转：目标分组始终没有渲染', { id, waited, mode });
               return;
             }
-            try {
-              const scroller = node.closest('.dsh-pins-root .scroll');
-              scroller?.scrollTo({ top: Math.max(0, node.offsetTop - 8), behavior: 'smooth' });
-            } catch {
-              /* a missing scroller just means the group is already visible */
+            // Find the scrollport by behaviour rather than by class name: a renamed class
+            // would silently turn this into a no-op, and the container is whichever
+            // ancestor actually scrolls.
+            let scroller = node.parentElement;
+            while (scroller) {
+              if (scroller.scrollHeight - scroller.clientHeight > 8) {
+                const overflowY = window.getComputedStyle(scroller).overflowY;
+                if (overflowY === 'auto' || overflowY === 'scroll') break;
+              }
+              scroller = scroller.parentElement;
             }
+            const target = scroller
+              ? Math.max(
+                  0,
+                  scroller.scrollTop +
+                    (node.getBoundingClientRect().top - scroller.getBoundingClientRect().top) -
+                    8,
+                )
+              : 0;
+            if (scroller) {
+              try {
+                scroller.scrollTo({ top: target, behavior: 'smooth' });
+              } catch {
+                scroller.scrollTop = target;
+              }
+            } else {
+              // No scrollable ancestor: let the browser place it instead of giving up.
+              try {
+                node.scrollIntoView({ block: 'start' });
+              } catch {
+                /* nothing left to try, and the pulse below still shows where it is */
+              }
+            }
+            console.log('[dsh-pins] 会话名跳转：已滚动', {
+              id,
+              found: Boolean(scroller),
+              target: Math.round(target),
+              scrollTop: scroller ? Math.round(scroller.scrollTop) : null,
+            });
             setPulseId(id);
             window.setTimeout(() => setPulseId((current) => (current === id ? null : current)), 1500);
+            // Say what happened on screen too: a jump that silently does nothing is the
+            // one failure this feature must not have.
+            announce(startedIn === 'all' ? '已定位到这个会话的分组' : '已切到「全部」并定位到这个会话的分组');
           };
-          // The list has to exist before its geometry does: switch scope, then measure.
-          window.requestAnimationFrame(() => scroll(6));
+          window.requestAnimationFrame(() => scroll(10, 0));
         },
-        [],
+        [mode],
       );
 
       // A failed write leaves the panel saying so until a write succeeds: state in
       // memory looks perfectly healthy, so silence here is the difference between a
       // user noticing and a user losing a session's worth of pins on refresh.
       const storage = store.storageStatus();
+
+      // Sessions shown as their own groups, with the order the user chose inside each.
+      // Built before the header because the header's bulk fold control reads them.
+      const sessionGroups = React.useMemo(() => {
+        if (mode !== 'all') return [];
+        const groups = overview.map(([id, entry, pins]) => [
+          id,
+          { title: sessionLabel({ ...entry, liveTitle: readSessionTitle(context, id) }), pins, byName: false, collapsed: collapsed.has(id) },
+        ]);
+        for (const [id, group] of nameHitGroups) groups.push([id, { ...group, collapsed: collapsed.has(id) }]);
+        return groups;
+      }, [mode, overview, nameHitGroups, collapsed, context]);
+
+      const fold = (id) =>
+        setCollapsed((current) => {
+          const next = new Set(current);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        });
+
+      /** Whether every listed group is folded, so the bulk control can offer the other way. */
+      const allFolded = sessionGroups.length > 0 && sessionGroups.every(([id]) => collapsed.has(id));
 
       const header = h(
         'div',
@@ -3552,6 +4154,21 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         h(
           'div',
           { className: 'tools' },
+          // Folding every group at once, the way a file tree does: with many Sessions,
+          // working through them one header at a time is the slow way to get an overview.
+          mode === 'all' && sessionGroups.length > 1
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'tool',
+                  title: allFolded ? '展开全部会话的片段' : '收起全部会话的片段，只看会话名',
+                  onClick: () => setCollapsed(allFolded ? new Set() : new Set(sessionGroups.map(([id]) => id))),
+                },
+                h('span', { className: 'tool-icon' }, allFolded ? '⌄' : '⌃'),
+                allFolded ? '全部展开' : '全部收起',
+              )
+            : null,
           h(
             'button',
             {
@@ -3650,23 +4267,6 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         notice !== '' ? h('div', { className: 'note' }, notice) : null,
       );
 
-      // Sessions shown as their own groups, with the order the user chose inside each.
-      const sessionGroups = React.useMemo(() => {
-        if (mode !== 'all') return [];
-        return overview.map(([id, entry, pins]) => [
-          id,
-          { title: sessionLabel({ ...entry, liveTitle: readSessionTitle(context, id) }), pins, collapsed: collapsed.has(id) },
-        ]);
-      }, [mode, overview, collapsed, context]);
-
-      const fold = (id) =>
-        setCollapsed((current) => {
-          const next = new Set(current);
-          if (next.has(id)) next.delete(id);
-          else next.add(id);
-          return next;
-        });
-
       /** Name hits, listed above the pins and marked as conversations rather than pins. */
       const namesSection =
         nameMatches.length > 0
@@ -3695,7 +4295,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
       if (mode === 'all') {
         body =
-          overview.length === 0 && nameMatches.length === 0
+          sessionGroups.length === 0 && nameMatches.length === 0
             ? h(
                 'div',
                 { className: 'empty' },
@@ -3714,6 +4314,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                       className: `group-block${pulseId === id ? ' is-pulse' : ''}`,
                       'data-session': id,
                       ref: (node) => {
+                        // A braced body on purpose: React treats a callback ref's return
+                        // value as a cleanup function, and `delete` returns true — so an
+                        // arrow body here would have React "clean up" the ref on every
+                        // render and the group would never be findable.
                         if (node) groupRefs.current[id] = node;
                         else delete groupRefs.current[id];
                       },
@@ -3733,6 +4337,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                         group.collapsed ? '▸' : '▾',
                       ),
                       h('span', { className: 'group-name' }, group.title),
+                      // A group kept because its name matched says so: the pins below it
+                      // are not search hits, they are the conversation's whole wall.
+                      group.byName ? h('span', { className: 'group-why' }, '会话名命中') : null,
                       h('span', { className: 'group-count' }, `${group.pins.length} 条`),
                     ),
                     group.collapsed
@@ -3743,18 +4350,26 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                             sessionId: id,
                             pin,
                             current: isCurrent && id === sessionId,
-                            taggable: false,
+                            // A card in 「全部」 is a full citizen, addressed to its own
+                            // conversation: it quotes, and it edits that conversation's tags.
+                            // It used to get `taggable: false` plus a no-op tag writer, which
+                            // did not make it read-only — the editor still opened on a click —
+                            // it only made every edit fail with a message about a tag the
+                            // passage never had.
+                            taggable: true,
                             cardState,
-                            // The overview is for reading; a card there does not edit tags,
-                            // and the panel-level manager above it is how one is removed.
-                            onTagChange: () => false,
+                            onQuote: (target) => quotePin(target, id),
+                            onTagChange: (action, tag) => changeTag(pin, id, action, tag),
+                            // Only the group matching the conversation on screen can be
+                            // jumped to; the others are here to be read, quoted and tagged.
+                            foreign: id !== sessionId,
                             context,
                           }),
                         ),
                   ),
                 ),
               );
-      } else if (visible.length === 0 && nameMatches.length === 0) {
+      } else if (visible.length === 0) {
         body = h(
           'div',
           { className: 'empty' },
@@ -3775,8 +4390,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         body = h(
           'div',
           { className: 'scroll', onScroll: () => cardState.scrollQuiet() },
-          // The same name search as the overview, minus your own conversation.
-          namesSection,
+          // No name hits here on purpose: this view manages this conversation, and a name
+          // it cannot open its contents from would be a promise it cannot keep.
           visible.map((pin) =>
             h(PinCard, {
               key: pin.id,
@@ -3785,29 +4400,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               current: false,
               taggable: true,
               cardState,
-              onQuote: (target) => {
-                const origin = pinOrigin(target, readSessionTitle(context, sessionId));
-                void requestQuote(
-                  { ...target.anchor, sessionId: String(sessionId) },
-                  target.anchor?.rawQuote ?? target.text ?? '',
-                  origin,
-                  false,
-                ).then((outcome) => {
-                  if (outcome.viaClipboard) announce('没有可用的输入框，已把引用复制到剪贴板');
-                  else if (outcome.ok) announce('已把引用放进输入框');
-                  else announce(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
-                });
-              },
-              onTagChange: (action, tag) => {
-                if (action === 'add') {
-                  const added = store.addTag(sessionId, pin.id, tag);
-                  if (added) announce(`已加标签 #${tag}`);
-                  return added;
-                }
-                const removed = store.removeTag(sessionId, pin.id, tag);
-                if (removed) announce(`已删除标签 #${tag}`);
-                return removed;
-              },
+              onQuote: (target) => quotePin(target, sessionId),
+              onTagChange: (action, tag) => changeTag(pin, sessionId, action, tag),
               context,
             }),
           ),
@@ -4103,11 +4697,101 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       };
       tryRegister();
 
+      /** Reveal the panel for a chip click; `''` means it worked, anything else is the reason. */
+      const openPanel = () => {
+        let service = null;
+        try {
+          service = context.get('sidebarRight') ?? null;
+        } catch (error) {
+          console.error('[dsh-pins] 取 sidebarRight 失败', error);
+        }
+        if (!service || typeof service.openTab !== 'function') return '右侧栏服务不可用';
+        try {
+          service.openTab(TAB_KIND);
+          return '';
+        } catch (error) {
+          console.error('[dsh-pins] openTab 失败', error);
+          return String(error?.message ?? error);
+        }
+      };
+
+      // The `@` menu's source registry arrives after this package loads, so this retries
+      // like the tab registry does. It differs in one way that matters: the pipeline keys
+      // sources by (trigger, name) and throws on a collision, so a live edit that runs
+      // `apply` again has to take its own previous registration down first — through a
+      // global, because the new module instance has no other way to reach it.
+      const TRIGGER_SLOT = '__dshPinsTriggerSource';
+      let triggerAttempts = 0;
+      let triggerTimer = null;
+      const registerTrigger = () => {
+        let service = null;
+        try {
+          service = context.get('inputTriggers') ?? null;
+        } catch (error) {
+          console.error('[dsh-pins] 取 inputTriggers 失败', error);
+          return;
+        }
+        if (!service || typeof service.registerSource !== 'function') {
+          triggerAttempts += 1;
+          if (triggerAttempts < 40) {
+            triggerTimer = schedule(registerTrigger, 250);
+            return;
+          }
+          console.warn('[dsh-pins] 输入触发器服务没有出现：输入框的 @ 菜单里不会有「固定片段」');
+          return;
+        }
+        const held = globalThis[TRIGGER_SLOT];
+        if (held && held.owner === PKG && typeof held.dispose === 'function') {
+          try {
+            held.dispose();
+          } catch (error) {
+            console.warn('[dsh-pins] 上一次的 @ 触发源释放失败', error);
+          }
+        }
+        try {
+          const dispose = service.registerSource(
+            createPinsTriggerSource({
+              titleOf: (sessionId) => readSessionTitle(context, sessionId),
+              openPanel,
+            }),
+          );
+          const record = { owner: PKG, dispose };
+          globalThis[TRIGGER_SLOT] = record;
+          // One line, once, at startup: without it "the source did not register" and "the
+          // menu did not offer it" look identical from the outside, and they need very
+          // different fixes.
+          console.log('[dsh-pins] 已注册 @ 固定片段触发源');
+          own(() => {
+            if (globalThis[TRIGGER_SLOT] === record) delete globalThis[TRIGGER_SLOT];
+            try {
+              dispose();
+            } catch (error) {
+              console.warn('[dsh-pins] @ 触发源释放失败', error);
+            }
+          });
+        } catch (error) {
+          const message = String(error?.message ?? error);
+          // Our own name already being taken means an earlier instance is still serving
+          // the menu; that is a working source, not a failure to report.
+          if (/already registered|already taken|duplicate|unique/i.test(message)) {
+            console.warn('[dsh-pins] @ 触发源已由先前实例注册，沿用现有注册', message);
+            return;
+          }
+          console.error('[dsh-pins] @ 触发源注册失败', error);
+        }
+      };
+      registerTrigger();
+
       return () => {
         try {
           if (timer !== null) context.clearTimeout(timer);
         } catch {
           /* the timer may already be gone */
+        }
+        try {
+          if (triggerTimer !== null) context.clearTimeout(triggerTimer);
+        } catch {
+          /* the retry may never have been scheduled */
         }
         while (disposers.length > 0) {
           const dispose = disposers.pop();

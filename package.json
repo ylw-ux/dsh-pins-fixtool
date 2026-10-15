@@ -1,7 +1,6 @@
 {
   "name": "dsh-pins",
-  "version": "0.1.0",
-  "private": true,
+  "version": "1.0.0",
   "description": "Pin selected passages from a conversation into a right-sidebar note wall, with jump-back to the source message.",
   "icon": "./icon.svg",
   "exports": {
@@ -16,8 +15,17 @@
     "cordis.patch.yml",
     "icon.svg",
     "locale/*.json",
+    "docs",
     "README.md"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ylw-ux/dsh-pins.git"
+  },
+  "homepage": "https://github.com/ylw-ux/dsh-pins#readme",
+  "bugs": {
+    "url": "https://github.com/ylw-ux/dsh-pins/issues"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -35,10 +43,14 @@
   "keywords": [
     "deepseek-harness",
     "dsh",
+    "dsh-plugin",
     "cordis",
     "plugin",
     "pin",
-    "annotation"
+    "pins",
+    "annotation",
+    "highlight",
+    "notes"
   ],
   "license": "MIT"
 }

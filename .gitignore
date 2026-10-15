@@ -1,0 +1,17 @@
+node_modules/
+pnpm-lock.yaml
+
+# Harness / plugin manager diagnostics
+.plugin-manager/
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Scratch
+*.tmp
+*.bak
