@@ -1,16 +1,10 @@
 # 固定片段 · dsh-pins
 
+**中文** | [English](README.en.md)
+
 > 把对话里划选的段落固定到右侧栏，像便签一样排成一列；点一下跳回原文，打 `@` 引用进消息。
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai) 的 Web UI 插件。读长回复时最容易丢的东西是"我刚刚读到哪、哪几句是关键"——划选、固定、回头看，就这么一件事。
-
-**English**: Pin selected passages from a conversation into a right-sidebar note wall. Jump back to the source, quote a passage into the composer with `@`, and export the whole wall as a Markdown outline.
-
----
-
-<!-- 截图：把图片放进 docs/images/ 后取消下面这行的注释
-![固定片段](docs/images/overview.png)
--->
 
 ## 安装
 
@@ -54,6 +48,7 @@ dsh plugin --profile web remove dsh-pins
 | 输入框里打 `@` | 菜单第一行就是「固定片段」；进去后**再打字就是搜索**（正文、标签都比对），选中即插入一个**引用芯片** |
 | 点输入框里的引用芯片 | 打开右侧栏，并让那条卡片脉冲高亮 |
 | 面板顶部 | 两个视图（本对话 / 全部）、四种排序、搜索、多选标签筛选、标签管理、markdown 提纲导出 |
+| 两个视图的筛选 | **各留一份**：在「全部」里选的标签和搜索词不会跟着你去「本对话」，切回来时它们还在原处。排序是全局偏好，两边共用并会被记住 |
 
 引用有两种形态，**都自带内容、都不是指针**：一是直接把带出处的引用块放进输入框；二是插入一个**引用芯片**，发送前由插件把它换成完整引用。两种形态的原文都真的进消息——模型看得到内容，发送后也永不过期。
 

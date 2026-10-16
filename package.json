@@ -16,7 +16,8 @@
     "icon.svg",
     "locale/*.json",
     "docs",
-    "README.md"
+    "README.md",
+    "README.en.md"
   ],
   "repository": {
     "type": "git",

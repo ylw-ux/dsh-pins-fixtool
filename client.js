@@ -2241,25 +2241,19 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
        * The one way the bar leaves.
        *
        * A bar that vanishes on its own is the hardest kind of defect to chase, because
-       * every close path looks innocent in isolation. Funnelling them through here means
-       * the reason is always known: it goes to the console, and a bar that closes within
-       * a second and a half of appearing says so on screen too — that case is never what
-       * the user asked for, and making them open DevTools to find out is a bad trade.
+       * every close path looks innocent in isolation — so every close still names its
+       * reason, in the console.
+       *
+       * It used to say so **on screen** as well whenever the bar had been up for less than
+       * a second and a half, with a line asking the user to send that sentence in. That was
+       * an instrument for finding which path was firing, and the paths are all known now.
+       * What was left was a toast on the most ordinary gesture there is — select, then
+       * click elsewhere — telling the user to do homework. A notice that appears during
+       * normal use is how people learn to ignore notices.
        */
-      const barOpenedAt = React.useRef(0);
-      const noteShown = React.useRef(false);
-      React.useEffect(() => {
-        noteShown.current = notice !== '';
-      }, [notice]);
-
       const dismissBar = React.useCallback((reason) => {
         console.log(`[dsh-pins] 收起浮条：${reason}`);
         setState(null);
-        const lived = Date.now() - barOpenedAt.current;
-        if (lived > 0 && lived < 1500 && noteShown.current === false) {
-          setNotice(`浮条自己收起了（${reason}）——如果这不是你点的，请把这句话发给我`);
-          window.setTimeout(() => setNotice(''), 6000);
-        }
       }, []);
 
       const accept = React.useCallback(
@@ -2276,7 +2270,6 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             }
             const rect = range.getBoundingClientRect();
             const target = liveSession();
-            barOpenedAt.current = Date.now();
             setState({
               anchor: anchor.anchor,
               text: anchor.text,
@@ -2978,6 +2971,17 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     const CHIP_SCOPE_TOKEN = `@${CHIP_SCOPE_PREFIX}`;
     /** The level-one row's opaque payload: a constant, so it cannot collide with an id. */
     const CHIP_ROOT_VALUE = 'root';
+    /**
+     * Level one has a second payload: this conversation holds nothing yet.
+     *
+     * It used to return no candidates at all in that case, which made "you have not pinned
+     * anything here" and "the plugin is broken" look exactly the same from the composer —
+     * a row that is simply absent, with nothing anywhere saying why. That ambiguity has now
+     * cost one bug report, so the row stays and says so instead.
+     */
+    const CHIP_EMPTY_VALUE = 'empty';
+    /** Session id whose empty result was already reported, so the log cannot spam per keystroke. */
+    let chipEmptyLogged = null;
 
     /**
      * A reference payload: the pin id on the first line, the finished passage below it.
@@ -3058,6 +3062,95 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      *
      * @param deps - `titleOf(sessionId)` and `openPanel()`, both owned by `apply`.
      */
+    /**
+     * The rows the `@` menu offers for one query: level one, or level two under the scope prefix.
+     *
+     * A plain function rather than a method on the source object, so `candidates` can wrap it:
+     * a source whose `candidates` rejects loses its whole group inside the pipeline, and that
+     * failure has to be reportable somewhere the user can see it.
+     */
+    function chipRows(session, req) {
+      const raw = session?.sessionId;
+      const sessionId = raw === undefined || raw === null ? '' : String(raw);
+      if (sessionId === '') return [];
+      const pins = store.list(sessionId);
+      const query = String(req?.query ?? '');
+
+      // Level two. The prefix decides, never the drill flag: typing the scope by hand has to
+      // land in exactly the same place as descending into it.
+      if (query.startsWith(CHIP_SCOPE_PREFIX)) {
+        const needle = query.slice(CHIP_SCOPE_PREFIX.length);
+        return chipMatches(pins, needle).map((pin) => {
+          const meta = chipRowMeta(pin);
+          return {
+            name: chipShort(pin),
+            ...(meta === '' ? {} : { description: meta }),
+            value: String(pin.id),
+            // No `section`: the crumb above already names this scope and carries the count,
+            // and a section heading said the same two words a second time.
+          };
+        });
+      }
+
+      // Level one. Nothing pinned here yet: the row stays and says so — and reports the
+      // facts once, because "the menu has no row" and "this conversation has no passages"
+      // are indistinguishable from the outside, which is exactly how this got chased as a
+      // registration bug for two rounds.
+      if (pins.length === 0) {
+        if (chipEmptyLogged !== sessionId) {
+          chipEmptyLogged = sessionId;
+          console.warn('[dsh-pins] @ 菜单：这个会话里查不到固定片段', {
+            sessionId,
+            storedSessions: store.sessions().map(([id, entry]) => `${id}(${entry?.pins?.length ?? 0} 条)`),
+            stateKeyBytes: (() => {
+              try {
+                return (globalThis.localStorage?.getItem(STATE_KEY) ?? '').length;
+              } catch (error) {
+                return `读不到 localStorage：${String(error?.message ?? error)}`;
+              }
+            })(),
+          });
+        }
+        // The pinyin forms matter here too: an IME sends `g`, `gu`, `gud` before 固定.
+        const wanted = [CHIP_SCOPE, '固定', 'guding'];
+        if (query !== '' && !wanted.some((key) => matchesText(key, query))) return [];
+        const elsewhere = pinsElsewhere(sessionId);
+        return [
+          {
+            name: CHIP_SCOPE,
+            // Say where the passages actually are. "This conversation has none" is a dead
+            // end unless it also says that the other conversations have six.
+            description: elsewhere > 0 ? `本对话还没有 · 别处 ${elsewhere} 条` : '本对话还没有',
+            value: CHIP_EMPTY_VALUE,
+          },
+        ];
+      }
+      // The pinyin forms are here because of how Chinese input actually arrives: an IME sends
+      // `g`, `gu`, `gud`… before it sends 固定, and every one of those intermediate states used
+      // to filter this row away — so the row blinked out mid-word and came back later, which
+      // reads as a broken menu rather than as a search miss.
+      const searchable = [CHIP_SCOPE, '固定', '引用', PIN_SOURCE_NAME, 'guding', 'pian', 'duan', 'quote'];
+      if (query !== '' && !searchable.some((key) => matchesText(key, query))) return [];
+      return [
+        {
+          name: CHIP_SCOPE,
+          description: `${pins.length} 条`,
+          value: CHIP_ROOT_VALUE,
+        },
+      ];
+    }
+
+    /** How many passages the **other** conversations hold, for the empty state's signpost. */
+    function pinsElsewhere(sessionId) {
+      const self = String(sessionId ?? '');
+      let total = 0;
+      for (const [id, entry] of store.sessions()) {
+        if (String(id) === self) continue;
+        total += entry?.pins?.length ?? 0;
+      }
+      return total;
+    }
+
     function createPinsTriggerSource(deps) {
       const sessionIdOf = (session) => {
         const id = session?.sessionId;
@@ -3082,40 +3175,35 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         // heading owned by this source says the same thing in its own words.
         showGroupTitle: false,
 
+        /**
+         * The candidate list, with its own failure made visible.
+         *
+         * The pipeline drops a source's whole group when `candidates` rejects, and the only
+         * trace is a console.error inside another plugin. From the composer that reads as the
+         * row appearing and then vanishing for no reason — the exact shape of a bug report
+         * that says "it flashed and disappeared". Reporting it to this plugin's own panel
+         * means the missing row always has a stated reason somewhere the user is looking.
+         */
         async candidates(session, req) {
-          const sessionId = sessionIdOf(session);
-          if (sessionId === '') return [];
-          const pins = store.list(sessionId);
-          const query = String(req?.query ?? '');
-
-          // Level two. The prefix decides, never the drill flag: typing the scope by hand
-          // has to land in exactly the same place as descending into it.
-          if (query.startsWith(CHIP_SCOPE_PREFIX)) {
-            const needle = query.slice(CHIP_SCOPE_PREFIX.length);
-            return chipMatches(pins, needle).map((pin) => {
-              const meta = chipRowMeta(pin);
-              return {
-                name: chipShort(pin),
-                ...(meta === '' ? {} : { description: meta }),
-                value: String(pin.id),
-                // No `section`: the crumb above already names this scope and carries the
-                // count, and a section heading said the same two words a second time.
-              };
-            });
+          try {
+            const rows = chipRows(session, req);
+            // Self-healing: one transient failure must not leave a standing red line behind,
+            // or the warning turns into furniture and stops being read. (A registration
+            // failure can never be cleared from here — without a registration there are no
+            // candidate calls at all.)
+            if (chipSourceStatus.state === 'failed') {
+              chipSourceStatus.state = 'ready';
+              chipSourceStatus.detail = '';
+              PINS_EVENTS.dispatchEvent(new Event('status'));
+            }
+            return rows;
+          } catch (error) {
+            console.error('[dsh-pins] 列出固定片段时出错', error);
+            chipSourceStatus.state = 'failed';
+            chipSourceStatus.detail = `列出固定片段时出错：${String(error?.message ?? error)}`;
+            PINS_EVENTS.dispatchEvent(new Event('status'));
+            return [];
           }
-
-          // Level one. No passages means no group at all: a row the user can pick while
-          // nothing happens is worse than a menu that simply does not offer it.
-          if (pins.length === 0) return [];
-          const searchable = [CHIP_SCOPE, '固定', '引用', PIN_SOURCE_NAME];
-          if (query !== '' && !searchable.some((key) => matchesText(key, query))) return [];
-          return [
-            {
-              name: CHIP_SCOPE,
-              description: `${pins.length} 条`,
-              value: CHIP_ROOT_VALUE,
-            },
-          ];
         },
 
         /**
@@ -3145,6 +3233,24 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
           // A crumb pick is the pipeline's only drill: leave the scope, keep the trigger.
           if (action === 'drill') return { text: '@', continue: true };
+          // Level one with nothing pinned: open the panel and say what to do, rather than
+          // descending into an empty list (which would close the menu and teach nothing).
+          if (value === CHIP_EMPTY_VALUE) {
+            const problem = deps.openPanel();
+            // The **floating** notice, not the panel's. The panel may be mounting right now,
+            // and a notice dispatched in the same tick as `openTab` is heard by nobody — the
+            // click then looks like it did nothing at all, which is what happened. This
+            // surface is a permanently mounted root-scope entry, so it cannot be missed.
+            const elsewhere = pinsElsewhere(sessionIdOf(pick?.session));
+            announceHere(
+              problem !== ''
+                ? `打不开固定片段面板：${problem}`
+                : elsewhere > 0
+                  ? `这个对话还没有固定片段；你在别的对话里固定过 ${elsewhere} 条，右栏切到「全部」就能看到。`
+                  : '这个对话还没有固定过内容：划选一段文字，点浮条上的「固定」就会出现在这里。',
+            );
+            return undefined;
+          }
           // Level one: descend in place. `continue` is a passenger here — the reopened
           // menu is the pipeline re-tracking the settled caret — but it states the intent.
           if (value === CHIP_ROOT_VALUE || value === '') return { text: CHIP_SCOPE_TOKEN, continue: true };
@@ -3201,12 +3307,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           if (!parsed) return false;
           const problem = deps.openPanel();
           if (problem !== '') {
-            announce(`打不开固定片段面板：${problem}`);
+            announceHere(`打不开固定片段面板：${problem}`);
             return true;
           }
           const sessionId = sessionIdOf(session);
           if (!store.get(sessionId, parsed.pinId)) {
-            announce('这条固定片段已被删除；引用内容还在输入框里，照常可以发送');
+            // Floating again: the same tick as `openTab` is too early for the panel's notice.
+            announceHere('这条固定片段已被删除；引用内容还在输入框里，照常可以发送');
             return true;
           }
           PINS_EVENTS.dispatchEvent(new CustomEvent('chip-reveal', { detail: { pinId: parsed.pinId } }));
@@ -3432,7 +3539,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           pin.anchor?.block === 'code' ? h('span', null, `代码${pin.anchor.lang ? ` · ${pin.anchor.lang}` : ''}`) : null,
           (pin.anchor?.partial === true || fullText.length > 600) ? h('span', { className: 'warn' }, '已截断') : null,
           markerReport.get(pin.id) === 'miss'
-            ? h('span', { className: 'warn', title: '这条消息在屏幕上，但没能定位到选中的文字：请点这条卡片，然后告诉我现象' }, '原文未找到')
+            ? h('span', { className: 'warn', title: '这条消息在屏幕上，但没能定位到选中的那段文字：点卡片会跳到整条消息' }, '原文未找到')
             : null,
           h('span', { className: 'time' }, relTime(pin.pinnedAt)),
           // The actions live inside the meta row, and the row hides its own trailing text
@@ -3558,8 +3665,38 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const isCurrent = props?.current === true;
       const [tick, setTick] = React.useState(0);
       const [mode, setMode] = React.useState(() => store.getMode());
-      const [query, setQuery] = React.useState('');
-      const [tagFilter, setTagFilter] = React.useState(() => new Set());
+      /**
+       * Search text and tag filter, kept **per view**.
+       *
+       * These were one pair of states shared by both views, so a tag picked while looking at
+       * 「全部」 silently narrowed 「本对话」. Because the pill row is scoped to each view's own
+       * passages, the carried-over tag can even be one this view does not offer — an empty
+       * list whose cause is on a screen you are not looking at. The two views offer the same
+       * features; they no longer inherit each other's filters.
+       */
+      const [viewFilters, setViewFilters] = React.useState(() => ({
+        session: { query: '', tags: new Set() },
+        all: { query: '', tags: new Set() },
+      }));
+      const filter = viewFilters[mode] ?? viewFilters.session;
+      const query = filter.query;
+      const tagFilter = filter.tags;
+
+      /** Patch the current view's filter only: `mode` is captured, so a switch cannot cross. */
+      const updateFilter = React.useCallback(
+        (patch) => {
+          setViewFilters((current) => {
+            const forMode = current[mode] ?? { query: '', tags: new Set() };
+            return { ...current, [mode]: { ...forMode, ...patch(forMode) } };
+          });
+        },
+        [mode],
+      );
+      const setQuery = React.useCallback((value) => updateFilter(() => ({ query: value })), [updateFilter]);
+      const setTagFilter = React.useCallback(
+        (next) => updateFilter((forMode) => ({ tags: typeof next === 'function' ? next(forMode.tags) : next })),
+        [updateFilter],
+      );
       const [notice, setNotice] = React.useState('');
       const [sort, setSort] = React.useState(() => store.getSort());
       /** Session groups the user folded shut, and the one a search result just revealed. */
@@ -3845,14 +3982,17 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         return () => setTurnSeqProvider(null);
       }, [sessionId, turnOutline]);
 
-      const toggleTagFilter = React.useCallback((tag) => {
-        setTagFilter((current) => {
-          const next = new Set(current);
-          if (next.has(tag)) next.delete(tag);
-          else next.add(tag);
-          return next;
-        });
-      }, []);
+      const toggleTagFilter = React.useCallback(
+        (tag) => {
+          setTagFilter((current) => {
+            const next = new Set(current);
+            if (next.has(tag)) next.delete(tag);
+            else next.add(tag);
+            return next;
+          });
+        },
+        [setTagFilter],
+      );
 
       const matchesTags = React.useCallback(
         (pin) => {
@@ -3898,6 +4038,15 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           PINS_EVENTS.removeEventListener('notice', onNotice);
         };
       }, [toggleTagFilter]);
+
+      // A status that flips after a minute of retrying (the @ source gave up) has to be able
+      // to redraw the panel, or the warning would sit there invisible until something else
+      // happened to change state.
+      React.useEffect(() => {
+        const onStatus = () => setTick((value) => value + 1);
+        PINS_EVENTS.addEventListener('status', onStatus);
+        return () => PINS_EVENTS.removeEventListener('status', onStatus);
+      }, []);
 
       // Manager order: most used first, so the labels worth curating are on top.
       // The counts are folded once per store version rather than per render, because
@@ -4112,6 +4261,17 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             )
           : null,
         storage.ok === false ? h('div', { className: 'storage-warn' }, storage.error) : null,
+        // The @ menu's row lives in another plugin's registry, so a failure to register is
+        // invisible from here: no row appears, nothing on screen says why, and the user's
+        // reasonable conclusion is that the feature was never built. That is how this
+        // failure reached them the first time, so it says so here now.
+        chipSourceStatus.state === 'failed'
+          ? h(
+              'div',
+              { className: 'storage-warn' },
+              `输入框 @ 菜单里的「固定片段」没能注册：${chipSourceStatus.detail || '未知原因'}。面板本身不受影响。`,
+            )
+          : null,
         h(
           'div',
           { className: 'tabs' },
@@ -4426,6 +4586,16 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     const tabTypeStatus = { state: 'pending', detail: '' };
 
     /**
+     * Whether the `@` menu source registered, so the panel can say so when it did not.
+     *
+     * This one is worse than the tab type when it fails quietly: the tab type failing still
+     * leaves a visible side effect (no panel), while this leaves the plugin looking complete
+     * and merely missing a row inside **another plugin's** menu — where nobody would think to
+     * look. States: `pending` (still waiting for the pipeline), `ready`, `failed`.
+     */
+    const chipSourceStatus = { state: 'pending', detail: '' };
+
+    /**
      * The left sidebar's entry to this panel.
      *
      * This lives in `sidebar.footer.action` — the slot declared for "actions beside
@@ -4721,46 +4891,80 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // `apply` again has to take its own previous registration down first — through a
       // global, because the new module instance has no other way to reach it.
       const TRIGGER_SLOT = '__dshPinsTriggerSource';
+      // Patience, in half-second steps. Waiting for a service that arrives after this package
+      // costs one idle timer; giving up on it costs the feature for the page's whole life.
+      const TRIGGER_TRIES = 120;
+      const TRIGGER_FAIL_TRIES = 20;
       let triggerAttempts = 0;
       let triggerTimer = null;
+
+      /** Drop whatever a previous module generation registered. Global first, so a throw cannot strand it. */
+      const dropHeldTrigger = () => {
+        const held = globalThis[TRIGGER_SLOT];
+        if (!held || held.owner !== PKG || typeof held.dispose !== 'function') return false;
+        delete globalThis[TRIGGER_SLOT];
+        try {
+          held.dispose();
+        } catch (error) {
+          console.warn('[dsh-pins] 旧的 @ 触发源释放失败', error);
+        }
+        return true;
+      };
+
       const registerTrigger = () => {
         let service = null;
         try {
           service = context.get('inputTriggers') ?? null;
         } catch (error) {
-          console.error('[dsh-pins] 取 inputTriggers 失败', error);
-          return;
+          // A throw here is treated as "not here yet", not as a verdict. It used to `return`,
+          // so a single throw during startup left the @ menu without this feature for the
+          // rest of the page's life, with nothing but one console.error to show for it.
+          console.warn('[dsh-pins] 取 inputTriggers 抛错，稍后重试', error);
+          service = null;
         }
         if (!service || typeof service.registerSource !== 'function') {
           triggerAttempts += 1;
-          if (triggerAttempts < 40) {
-            triggerTimer = schedule(registerTrigger, 250);
+          if (triggerAttempts < TRIGGER_TRIES) {
+            triggerTimer = schedule(registerTrigger, 500);
             return;
           }
-          console.warn('[dsh-pins] 输入触发器服务没有出现：输入框的 @ 菜单里不会有「固定片段」');
+          console.warn('[dsh-pins] 输入触发器服务始终没有出现：输入框的 @ 菜单里不会有「固定片段」');
+          chipSourceStatus.state = 'failed';
+          chipSourceStatus.detail = '输入触发器服务（inputTriggers）始终没有出现';
+          PINS_EVENTS.dispatchEvent(new Event('status'));
           return;
         }
-        const held = globalThis[TRIGGER_SLOT];
-        if (held && held.owner === PKG && typeof held.dispose === 'function') {
-          try {
-            held.dispose();
-          } catch (error) {
-            console.warn('[dsh-pins] 上一次的 @ 触发源释放失败', error);
-          }
-        }
         try {
-          const dispose = service.registerSource(
-            createPinsTriggerSource({
-              titleOf: (sessionId) => readSessionTitle(context, sessionId),
-              openPanel,
-            }),
-          );
+          const source = createPinsTriggerSource({
+            titleOf: (sessionId) => readSessionTitle(context, sessionId),
+            openPanel,
+          });
+          let dispose;
+          try {
+            dispose = service.registerSource(source);
+          } catch (error) {
+            const message = String(error?.message ?? error);
+            if (!/already registered|already taken|duplicate|unique/i.test(message)) throw error;
+            // The name is still held — by a previous module generation, or by an instance
+            // whose teardown has not run yet. Take that one down and register ours again.
+            //
+            // The old order was drop-then-register, and it had a hole: when the registration
+            // half failed, the drop half had already destroyed the working source, so the
+            // menu lost the entry entirely — while the code reported "already registered,
+            // keeping the existing one" as if something were still serving it.
+            console.warn('[dsh-pins] @ 触发源名字被占用，释放旧的再注册一次', message);
+            dropHeldTrigger();
+            dispose = service.registerSource(source);
+          }
           const record = { owner: PKG, dispose };
           globalThis[TRIGGER_SLOT] = record;
           // One line, once, at startup: without it "the source did not register" and "the
           // menu did not offer it" look identical from the outside, and they need very
           // different fixes.
           console.log('[dsh-pins] 已注册 @ 固定片段触发源');
+          chipSourceStatus.state = 'ready';
+          chipSourceStatus.detail = '';
+          PINS_EVENTS.dispatchEvent(new Event('status'));
           own(() => {
             if (globalThis[TRIGGER_SLOT] === record) delete globalThis[TRIGGER_SLOT];
             try {
@@ -4770,14 +4974,15 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             }
           });
         } catch (error) {
-          const message = String(error?.message ?? error);
-          // Our own name already being taken means an earlier instance is still serving
-          // the menu; that is a working source, not a failure to report.
-          if (/already registered|already taken|duplicate|unique/i.test(message)) {
-            console.warn('[dsh-pins] @ 触发源已由先前实例注册，沿用现有注册', message);
+          console.error('[dsh-pins] @ 触发源注册失败，稍后重试', error);
+          triggerAttempts += 1;
+          if (triggerAttempts < TRIGGER_FAIL_TRIES) {
+            triggerTimer = schedule(registerTrigger, 500);
             return;
           }
-          console.error('[dsh-pins] @ 触发源注册失败', error);
+          chipSourceStatus.state = 'failed';
+          chipSourceStatus.detail = String(error?.message ?? error);
+          PINS_EVENTS.dispatchEvent(new Event('status'));
         }
       };
       registerTrigger();
