@@ -67,16 +67,6 @@ Quoting comes in two shapes, and **both carry their content — neither is a poi
 - **A selection longer than 600 characters is kept as its first 600** (the card says 「已截断」). Quotes and chips share that ceiling.
 - **When the same text appears several times in one message**, the jump picks the occurrence nearest the recorded offset that also passes a text check; if none does, it falls back to the whole message and marks the card 「原文未找到」.
 
-## Design notes
-
-The details are in [docs/设计说明.md](docs/设计说明.md) (Chinese), covering:
-
-- why a pin is *message key + quote + relative offset* rather than an HTML snapshot;
-- where the two views' responsibilities divide, and why tag editing has to actually save;
-- why a reference chip carries the whole passage in its payload (**a send is never blocked by this plugin**, and a page reload never degrades it);
-- the four constraints behind hover expansion (container units, the `margin` gutter, the scroll-quiet window, sticky editing);
-- what the "Host tool" would be, and why it has dropped from a requirement to an option.
-
 ## Compatibility
 
 Verified on: **DSH `0.2.0-rc.2` · Node `24.14.1` · pnpm `12.6.0`**.
@@ -93,7 +83,7 @@ dsh-pins/
 ├── client.js            browser half: the entire plugin lives in this one file
 ├── locale/{zh,en}.json  display name and description (the meta.title the marketplace reads)
 ├── icon.svg             icon (≤ 256 KiB)
-└── docs/                design notes and install troubleshooting (Chinese)
+└── docs/                install troubleshooting (Chinese)
 ```
 
 For local development, `dsh plugin --profile web add <absolute path>` installs it as a link dependency; edit `client.js` and refresh the page. The `plugin_manager` tool and the Web Plugins page manage the same profile state.
