@@ -12,7 +12,7 @@
 
 ```bash
 # 从 GitHub 安装
-dsh plugin --profile web add github:ylw-ux/dsh-pins
+dsh plugin --profile web add github:ylw-ux/dsh-pins-fixtool
 
 # 已发布到 npm 之后
 dsh plugin --profile web add dsh-pins

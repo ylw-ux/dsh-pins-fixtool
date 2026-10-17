@@ -12,7 +12,7 @@ Requires the Harness Web UI (`dsh web`). One command — it also **selects the b
 
 ```bash
 # from GitHub
-dsh plugin --profile web add github:ylw-ux/dsh-pins
+dsh plugin --profile web add github:ylw-ux/dsh-pins-fixtool
 
 # once published to npm
 dsh plugin --profile web add dsh-pins

@@ -21,11 +21,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ylw-ux/dsh-pins.git"
+    "url": "git+https://github.com/ylw-ux/dsh-pins-fixtool.git"
   },
-  "homepage": "https://github.com/ylw-ux/dsh-pins#readme",
+  "homepage": "https://github.com/ylw-ux/dsh-pins-fixtool#readme",
   "bugs": {
-    "url": "https://github.com/ylw-ux/dsh-pins/issues"
+    "url": "https://github.com/ylw-ux/dsh-pins-fixtool/issues"
   },
   "dsh": {
     "bundle": {
