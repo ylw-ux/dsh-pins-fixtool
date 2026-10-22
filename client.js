@@ -2337,17 +2337,19 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           if (action.type === 'quote') {
             // The composer is a session-scoped surface the bar cannot reach; the panel
             // performs the insertion (and the pin, when the gesture carries a tag) and
-            // reports back, so the outcome is stated here rather than leaving the click
-            // looking ignored.
+            // reports back. `showPanel` rides along as the wake-up: quoting is the one
+            // gesture that cannot work while the panel has never been mounted, so opening
+            // the sidebar is part of the action rather than homework for the user.
             const anchor = { ...current.anchor, sessionId: String(target) };
             const already = findExistingPin(store, target, anchor);
             const origin = already ? pinOrigin(already, readSessionTitle(context, target)) : '';
             dismissBar(action.alsoPin === true ? '固定并引用之后' : '引用之后');
-            void requestQuote(anchor, current.text, origin, action.alsoPin === true, action.tag).then((outcome) => {
+            void requestQuote(anchor, current.text, origin, action.alsoPin === true, action.tag, showPanel).then((outcome) => {
               const pinned = action.alsoPin === true ? '已固定并' : '';
-              if (outcome.viaClipboard) say(`${pinned}把引用复制到了剪贴板（没有可用的输入框）`);
+              if (outcome.ok && outcome.viaClipboard) say(`${pinned}把引用复制到了剪贴板（输入框不可用）`);
               else if (outcome.ok) say(`${pinned}把引用放进输入框`);
-              else if (outcome.reason === 'no-panel') say('右侧栏没打开，已复制到剪贴板');
+              // Nothing claims a clipboard copy here: this path never writes one, and saying
+              // so left the user with an empty clipboard and a notice that insisted otherwise.
               else say(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
             });
             return;
@@ -2904,11 +2906,37 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     /**
      * Ask the panel to put a quote into the composer.
      *
-     * The composer's actions are a session-scoped slot prop, and the floating bar lives
-     * at root scope where they do not exist. The bar therefore asks the panel, which
-     * does receive them; the panel answers by reporting the outcome.
+     * The composer's actions are a session-scoped slot prop, and the floating bar lives at
+     * root scope where they do not exist — so the bar asks the panel, which does receive
+     * them, and the panel answers by token.
+     *
+     * The panel is a **lazily mounted** tab, though. Until it has been opened once there is
+     * nobody on the other end of that event, and treating that as "no composer exists" was
+     * wrong twice over: it told the user the quote had been copied to the clipboard when
+     * nothing had been written (the write sat 600 ms past the click, outside the user
+     * gesture the clipboard API requires), and it left the passage nowhere at all. The
+     * panel's absence does not mean "give up", it means "mount it": ask for the panel to
+     * open, wait until one actually answers a ping, and only then hand over the quote.
+     *
+     * @param wake - opens the panel; returns a reason string, or `''` when it worked.
+     * @returns the panel's outcome, or `{ ok: false, reason, message }`.
      */
-    function requestQuote(anchor, text, origin, alsoPin, tag) {
+    async function requestQuote(anchor, text, origin, alsoPin, tag, wake) {
+      // No wake-up on the first attempt: a panel that is already mounted answers in the
+      // same tick, and opening a sidebar the user did not ask for would be a visible change
+      // for no reason.
+      const first = await attemptQuote(anchor, text, origin, alsoPin, tag, 400);
+      if (first.reason !== 'no-panel') return first;
+      const problem = typeof wake === 'function' ? wake() : '没有打开右侧栏的入口';
+      if (problem !== '') return { ok: false, reason: 'no-panel', message: problem };
+      // React needs a frame or two after `openTab` before the panel's listener exists, so
+      // ping until it answers rather than sleeping for a guessed duration.
+      await waitForPanel(1500);
+      return attemptQuote(anchor, text, origin, alsoPin, tag, 1500);
+    }
+
+    /** One `quote-req` round trip. Resolves `{ reason: 'no-panel' }` when nobody answers. */
+    function attemptQuote(anchor, text, origin, alsoPin, tag, timeoutMs) {
       return new Promise((resolve) => {
         const token = `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
         let settled = false;
@@ -2923,15 +2951,42 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           if (event.detail?.token !== token) return;
           finish(event.detail);
         };
-        // No panel listening means no composer surface at all (the right column is
-        // closed); the caller then copies instead of pretending it worked.
-        const timer = window.setTimeout(() => finish({ ok: false, reason: 'no-panel' }), 600);
+        const timer = window.setTimeout(() => finish({ ok: false, reason: 'no-panel' }), timeoutMs);
         PINS_EVENTS.addEventListener('quote-done', onDone);
         PINS_EVENTS.dispatchEvent(
           new CustomEvent('quote-req', {
             detail: { token, sessionId: anchor?.sessionId ?? '', anchor, text, origin, alsoPin: alsoPin === true, tag },
           }),
         );
+      });
+    }
+
+    /**
+     * Resolve once a mounted panel answers a ping, or after `timeoutMs`.
+     *
+     * A ping carries no quote, so a late answer cannot insert anything twice. Re-sending the
+     * *quote* as the retry would: two mounted panels, or one that answers on both attempts,
+     * would paste the passage twice — which is why readiness is probed with something inert.
+     */
+    function waitForPanel(timeoutMs) {
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
+          window.clearInterval(poll);
+          PINS_EVENTS.removeEventListener('panel-ready', onReady);
+          resolve();
+        };
+        const onReady = () => finish();
+        const timer = window.setTimeout(finish, timeoutMs);
+        PINS_EVENTS.addEventListener('panel-ready', onReady);
+        const ping = () => {
+          if (!settled) PINS_EVENTS.dispatchEvent(new Event('panel-ping'));
+        };
+        const poll = window.setInterval(ping, 60);
+        ping();
       });
     }
 
@@ -3819,7 +3874,15 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // The floating bar lives at root scope, where the composer's actions do not exist,
       // so it asks the panel to insert on its behalf and the panel answers by token.
       React.useEffect(() => {
-        const onRequest = (event) => {
+        /**
+         * Answer the bar's readiness ping.
+         *
+         * The bar has to know a panel exists before it hands over a quote, because a quote
+         * sent to a panel that is still mounting is heard by nobody — and retrying the quote
+         * itself could insert it twice. A ping carries no payload, so a late answer is inert.
+         */
+        const onPing = () => PINS_EVENTS.dispatchEvent(new Event('panel-ready'));
+        const onRequest = async (event) => {
           const detail = event.detail ?? {};
           const answer = (payload) => {
             PINS_EVENTS.dispatchEvent(new CustomEvent('quote-done', { detail: { token: detail.token, ...payload } }));
@@ -3854,20 +3917,27 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               answer({ ok: true });
               return;
             }
-            // No composer to write into: hand over the text instead of losing it.
+            // Last resort: hand the text over rather than losing it — and report a copy only
+            // when the write actually resolved. `void navigator.clipboard.writeText(...)`
+            // rejects asynchronously, so the old code announced a copy that never happened.
             try {
-              void navigator.clipboard?.writeText(markdown);
+              await navigator.clipboard.writeText(markdown);
               answer({ ok: true, viaClipboard: true });
-            } catch {
-              answer({ ok: false, reason: 'failed', message: outcome.message });
+            } catch (error) {
+              console.warn('[dsh-pins] 写剪贴板失败', error);
+              answer({ ok: false, reason: 'clipboard', message: `${outcome.message}；也没能写入剪贴板` });
             }
           } catch (error) {
             console.error('[dsh-pins] 引用处理失败', error);
             answer({ ok: false, reason: 'failed', message: String(error?.message ?? error) });
           }
         };
+        PINS_EVENTS.addEventListener('panel-ping', onPing);
         PINS_EVENTS.addEventListener('quote-req', onRequest);
-        return () => PINS_EVENTS.removeEventListener('quote-req', onRequest);
+        return () => {
+          PINS_EVENTS.removeEventListener('panel-ping', onPing);
+          PINS_EVENTS.removeEventListener('quote-req', onRequest);
+        };
       }, [insertIntoComposer, sessionId, context]);
 
       // A chip in the composer asked for the passage it was made from.
