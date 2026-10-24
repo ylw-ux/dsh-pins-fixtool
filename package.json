@@ -1,6 +1,6 @@
 {
   "name": "dsh-pins",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Pin selected passages from a conversation into a right-sidebar note wall, with jump-back to the source message.",
   "icon": "./icon.svg",
   "exports": {
