@@ -45,6 +45,32 @@ window.__ModuleLoader__.load({
     const PINS_EVENTS = new EventTarget();
 
     /**
+     * The pin created most recently, remembered for a moment.
+     *
+     * The panel is often opened *by* the pin that was just made, so the panel that
+     * should flash the new card mounts after the event has already fired. Keeping the
+     * id here lets that first render catch up instead of losing the feedback.
+     */
+    let lastPinAdded = null;
+
+    /**
+     * Say that a pin was just created, on both surfaces at once.
+     *
+     * The toast says it too, but the confirmation belongs on the card that appeared;
+     * the panel draws that flash on the card's own DOM node (the same mechanism the
+     * composer chip uses), so nothing about it has to live in render state.
+     */
+    function noteNewPin(pin) {
+      if (!pin || typeof pin.id !== 'string' || pin.id === '') return;
+      lastPinAdded = { pinId: pin.id, at: Date.now() };
+      try {
+        PINS_EVENTS.dispatchEvent(new CustomEvent('pin-added', { detail: { pinId: pin.id } }));
+      } catch (error) {
+        console.warn('[dsh-pins] 新固定片段的反馈没能发出', error);
+      }
+    }
+
+    /**
      * The order the list is shown in.
      *
      * Two families, each with both directions:
@@ -641,6 +667,7 @@ window.__ModuleLoader__.load({
           // Told to the caller, never written into the record: whether this write
           // reached storage is a fact about this moment, not about the pin.
           api.lastPersisted = commit();
+          noteNewPin(record);
           return record;
         },
         remove(sessionId, id) {
@@ -1729,175 +1756,266 @@ window.__ModuleLoader__.load({
 /* Every selector below is scoped to a class this plugin alone uses. No layout
    rule keys off a data attribute: attribute selectors here once collided with
    the host's own overlay rules and with each other, which made the floating bar
-   lay itself out as a column and cover the frame. */
+   lay itself out as a column and cover the frame.
+
+   Tokens: every colour, radius, type size and shadow below comes from the host
+   theme, checked against @deepseek-ai/dsh-client-ui-theme for DSH 0.2.1-rc.2.
+   A token that does not exist fails silently, so none are invented here. The
+   plugin's own custom properties are prefixed --dsh-pins- and never hold a
+   colour, so a theme switch cannot miss them. */
+
+/* One transition vocabulary for everything clickable, so hover and focus move at
+   the same speed instead of each control inventing its own. */
+.dsh-pins-bar button,.dsh-pins-root button,.dsh-pins-root .tag,.dsh-pins-entry,.dsh-pins-return{
+  transition:background-color 140ms cubic-bezier(0,0,.2,1),color 140ms cubic-bezier(0,0,.2,1),
+    border-color 140ms cubic-bezier(0,0,.2,1),box-shadow 140ms cubic-bezier(0,0,.2,1)}
+
 .dsh-pins-bar{position:fixed;z-index:30;display:inline-flex;flex-flow:row wrap;align-content:center;
   align-items:center;justify-content:center;gap:2px;row-gap:3px;
-  width:auto;max-width:min(400px, calc(100vw - 24px));height:auto;padding:3px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;
-  background:var(--dsw-alias-bg-overlay);box-shadow:0 6px 20px rgba(0,0,0,.22);font-size:12px;
-  color:var(--dsw-alias-label-primary);user-select:none;font-family:inherit;line-height:1;pointer-events:auto}
-.dsh-pins-bar button{display:inline-flex;align-items:center;height:26px;padding:0 9px;border:none;border-radius:7px;
-  background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;white-space:nowrap}
-.dsh-pins-bar button:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-.dsh-pins-bar button[data-primary]{color:var(--dsw-alias-brand-primary);font-weight:600}
+  width:auto;max-width:min(400px, calc(100vw - 24px));height:auto;padding:4px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);
+  background:var(--dsw-alias-bg-overlay);box-shadow:var(--dsw-elevation-prominent);
+  font-size:var(--dsw-font-xxs-12-font-size,12px);color:var(--dsw-alias-label-primary);
+  user-select:none;font-family:inherit;line-height:1;pointer-events:auto}
+.dsh-pins-bar button{display:inline-flex;align-items:center;height:26px;padding:0 9px;border:none;
+  border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);
+  font:inherit;line-height:1;cursor:pointer;white-space:nowrap}
+.dsh-pins-bar button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+/* The primary action is the host's own primary button, not a coloured label: the
+   filled surface is what makes "pin this" the obvious click in a six-button bar. */
+.dsh-pins-bar button[data-primary]{background:var(--dsw-alias-button-primary-fill);
+  color:var(--dsw-alias-label-primary-foreground);font-weight:500}
+.dsh-pins-bar button[data-primary]:hover{background:var(--dsw-alias-button-primary-hover);
+  color:var(--dsw-alias-label-primary-foreground)}
 /* The tag button stays lit while its box is open, so the extra control has a visible owner. */
-.dsh-pins-bar button[data-on]{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-.dsh-pins-bar .sep{width:1px;height:16px;margin:0 3px;background:var(--dsw-alias-border-l1);flex:none}
+.dsh-pins-bar button[data-on]{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent);
+  color:var(--dsw-alias-label-primary)}
+.dsh-pins-bar .sep{width:1px;height:16px;margin:0 3px;background:var(--dsw-alias-border-l2);flex:none}
 .dsh-pins-bar input{width:104px;height:26px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
-  border-radius:7px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none}
+  border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);
+  font:inherit;outline:none;transition:border-color 140ms cubic-bezier(0,0,.2,1)}
+.dsh-pins-bar input:focus{border-color:var(--dsw-alias-brand-primary)}
+.dsh-pins-bar input::placeholder{color:var(--dsw-alias-label-tertiary)}
 
-.dsh-pins-root{display:flex;flex-direction:column;height:100%;min-height:0;font-size:12px;
-  color:var(--dsw-alias-label-primary);font-family:inherit;background:var(--dsw-specific-sidebar-fill,transparent)}
-.dsh-pins-root .hd{display:flex;flex-direction:column;gap:8px;padding:10px 12px 8px;
-  border-bottom:1px solid var(--dsw-alias-border-l1);max-height:70vh;overflow-y:auto;overscroll-behavior:contain}
-.dsh-pins-root .tabs{display:flex;gap:2px;padding:2px;border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
-.dsh-pins-root .tabs button{flex:1;height:24px;border:none;border-radius:6px;background:transparent;
+.dsh-pins-root{display:flex;flex-direction:column;height:100%;min-height:0;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);color:var(--dsw-alias-label-primary);font-family:inherit;
+  background:var(--dsw-specific-sidebar-fill,transparent)}
+.dsh-pins-root .hd{display:flex;flex-direction:column;gap:8px;padding:10px 12px 9px;
+  border-bottom:1px solid var(--dsw-alias-border-l1);max-height:70vh;max-height:70cqh;
+  overflow-y:auto;overscroll-behavior:contain}
+.dsh-pins-root .tabs{display:flex;gap:2px;padding:2px;border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-layer-2)}
+.dsh-pins-root .tabs button{flex:1;height:26px;display:inline-flex;align-items:center;justify-content:center;
+  box-sizing:border-box;border:none;border-radius:var(--dsw-radius-xs);background:transparent;
   color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer}
-.dsh-pins-root .tabs button[data-on]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-weight:600}
+.dsh-pins-root .tabs button:hover{color:var(--dsw-alias-label-primary)}
+.dsh-pins-root .tabs button[data-on]{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);
+  color:var(--dsw-alias-label-primary);font:var(--dsw-font-xxs-strong-12)}
 .dsh-pins-root .search{display:flex;align-items:center;gap:6px}
-.dsh-pins-root .search input{flex:1;min-width:0;height:26px;padding:0 9px;border:1px solid var(--dsw-alias-border-l1);
-  border-radius:7px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none}
-.dsh-pins-root .search input:focus{border-color:var(--dsw-alias-border-l2)}
-.dsh-pins-root .search .clear{width:22px;height:22px;flex:none;display:inline-flex;align-items:center;justify-content:center;
-  border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;cursor:pointer}
-.dsh-pins-root .search .clear:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-.dsh-pins-root .count{font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:nowrap}
+.dsh-pins-root .search input{flex:1;min-width:0;height:28px;padding:0 10px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none;
+  transition:border-color 140ms cubic-bezier(0,0,.2,1),box-shadow 140ms cubic-bezier(0,0,.2,1)}
+.dsh-pins-root .search input:focus{border-color:var(--dsw-alias-brand-primary);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent)}
+.dsh-pins-root .search input::placeholder{color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-root .search .clear{width:24px;height:24px;flex:none;display:inline-flex;align-items:center;
+  justify-content:center;border:none;border-radius:var(--dsw-radius-sm);background:transparent;
+  color:var(--dsw-alias-label-tertiary);font:inherit;font-size:var(--dsw-font-xxxs-11-font-size,11px);
+  line-height:1;cursor:pointer}
+.dsh-pins-root .search .clear:hover{background:var(--dsw-alias-interactive-bg-hover);
+  color:var(--dsw-alias-label-primary)}
+.dsh-pins-root .count{font-size:var(--dsw-font-xxxs-11-font-size,11px);color:var(--dsw-alias-label-tertiary);
+  white-space:nowrap;font-variant-numeric:tabular-nums}
 /* The header's action row: order switch and export, one compact row so the panel keeps
    its scarce vertical space for the pins themselves. */
 .dsh-pins-root .tools{display:flex;gap:6px}
-.dsh-pins-root .tool{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);
-  border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;cursor:pointer}
-.dsh-pins-root .tool:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
-.dsh-pins-root .tool-icon{color:var(--dsw-alias-label-tertiary);font-size:11px}
+.dsh-pins-root .tool{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 9px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:transparent;
+  color:var(--dsw-alias-label-secondary);font:inherit;font-size:var(--dsw-font-xxs-12-font-size,12px);
+  line-height:1;cursor:pointer}
+.dsh-pins-root .tool:hover{background:var(--dsw-alias-interactive-bg-hover);
+  color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
+.dsh-pins-root .tool-icon{color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xxs-12-font-size,12px);line-height:1}
 /* A query container so the expanded cap can be a share of the LIST viewport rather
    than of the window: the right column is often shorter than the window, and viewport
    units would then allow a card taller than the list itself. */
 .dsh-pins-root .scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:8px;
-  container-type:size}
-.dsh-pins-root .group{margin:0 0 2px;padding:6px 6px 2px;font-size:11px;color:var(--dsw-alias-label-tertiary);
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dsh-pins-root .group span{color:var(--dsw-alias-label-secondary);font-weight:600}
-/* A Session group: its header folds the group, its rows are the pins. */
+  container-type:size;scrollbar-width:thin;scrollbar-color:var(--dsw-alias-scrollbar-bg-l2) transparent}
+.dsh-pins-root .group{margin:0 0 2px;padding:6px;font-size:var(--dsw-font-xxxs-11-font-size,11px);
+  color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* A Session group: its header folds the group, its rows are the pins. Each child
+   carries its own colour, so the count and the "name hit" pill can be quieter than
+   the group name without a specificity fight. */
 .dsh-pins-root .group-block{display:flex;flex-direction:column}
 .dsh-pins-root .group-block>.group{display:flex;align-items:center;gap:6px;white-space:normal;
-  border-radius:7px;padding:6px 6px 6px 4px}
-.dsh-pins-root .group-block>.group:hover{background:var(--dsw-alias-bg-layer-2)}
-.dsh-pins-root .group-fold{flex:none;width:18px;height:18px;display:inline-flex;align-items:center;justify-content:center;
-  border:none;border-radius:5px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:10px;cursor:pointer}
-.dsh-pins-root .group-fold:hover{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary)}
+  border-radius:var(--dsw-radius-sm);padding:6px 8px 6px 4px}
+.dsh-pins-root .group-block>.group:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-root .group-fold{flex:none;width:20px;height:20px;display:inline-flex;align-items:center;
+  justify-content:center;border:none;border-radius:var(--dsw-radius-xs);background:transparent;
+  color:var(--dsw-alias-label-tertiary);font:inherit;font-size:var(--dsw-font-xxxs-11-font-size,11px);
+  line-height:1;cursor:pointer}
+.dsh-pins-root .group-fold:hover{background:var(--dsw-alias-interactive-bg-hover-solid);
+  color:var(--dsw-alias-label-primary)}
 .dsh-pins-root .group-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  color:var(--dsw-alias-label-secondary);font-weight:600}
-.dsh-pins-root .group-count{flex:none;color:var(--dsw-alias-label-tertiary);font-weight:400}
-.dsh-pins-root .group-why{flex:none;padding:1px 5px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);
-  color:var(--dsw-alias-label-tertiary);font-size:9px;font-weight:400}
+  color:var(--dsw-alias-label-secondary);font-weight:500;font-size:var(--dsw-font-xxs-12-font-size,12px)}
+.dsh-pins-root .group-count{flex:none;color:var(--dsw-alias-label-tertiary);font-weight:400;
+  font-variant-numeric:tabular-nums}
+.dsh-pins-root .group-why{flex:none;padding:1px 6px;border-radius:999px;
+  background:var(--dsw-alias-interactive-bg-hover-solid);color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);font-weight:400;line-height:16px}
 .dsh-pins-root .group-block.is-pulse{animation:dsh-pins-group-pulse 1.4s ease-out}
 @keyframes dsh-pins-group-pulse{
   0%{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 18%,transparent)}
   100%{background:transparent}}
 /* One card, when a chip in the composer asked for the passage it was made from. */
 .dsh-pins-root .dsh-pins-card.is-pulse{animation:dsh-pins-card-pulse 1.6s ease-out}
+/* A pin that was just created flashes once where it landed: the confirmation belongs
+   on the card that appeared, not only in the toast that says it happened. */
+.dsh-pins-card.is-fresh{animation:dsh-pins-card-pulse 1.2s cubic-bezier(.215,.61,.355,1)}
 @keyframes dsh-pins-card-pulse{
   0%{border-color:var(--dsw-alias-brand-primary);
-     background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,transparent)}
+    background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,transparent)}
   100%{border-color:var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}}
 /* Name hits: conversations the search matched, kept visually distinct from pin cards. */
-.dsh-pins-root .namehits{display:flex;flex-direction:column;gap:3px;margin:0 6px 10px;padding:6px;
-  border:1px dashed var(--dsw-alias-border-l2);border-radius:8px}
-.dsh-pins-root .namehits-head{font-size:10px;color:var(--dsw-alias-label-tertiary)}
-.dsh-pins-root .namehit{display:flex;align-items:center;gap:6px;min-width:0;padding:4px 6px;border:none;border-radius:6px;
-  background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;text-align:left;cursor:pointer}
-.dsh-pins-root .namehit:hover{background:var(--dsw-alias-bg-layer-2)}
-.dsh-pins-root .namehit-tag{flex:none;padding:1px 5px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);
-  color:var(--dsw-alias-label-tertiary);font-size:9px}
+.dsh-pins-root .namehits{display:flex;flex-direction:column;gap:3px;margin:0 6px 10px;padding:8px;
+  border:1px dashed var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md)}
+.dsh-pins-root .namehits-head{font-size:var(--dsw-font-xxxs-11-font-size,11px);
+  color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-root .namehit{display:flex;align-items:center;gap:6px;min-width:0;padding:5px 6px;border:none;
+  border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-primary);
+  font:inherit;font-size:var(--dsw-font-xxs-12-font-size,12px);text-align:left;cursor:pointer}
+.dsh-pins-root .namehit:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-root .namehit-tag{flex:none;padding:1px 6px;border-radius:999px;
+  background:var(--dsw-alias-interactive-bg-hover-solid);color:var(--dsw-alias-label-secondary);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:16px}
 .dsh-pins-root .namehit-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dsh-pins-card{position:relative;box-sizing:border-box;width:100%;margin:0 0 6px;padding:8px 9px 7px;
-  border:1px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-layer-1);
-  text-align:left;font:inherit;color:inherit;cursor:pointer}
-.dsh-pins-card:hover{border-color:var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2)}
-.dsh-pins-card[data-current]{border-color:var(--dsw-alias-brand-primary)}
-.dsh-pins-card .meta{position:relative;display:flex;align-items:center;gap:5px;margin-bottom:4px;font-size:10px;
-  color:var(--dsw-alias-label-tertiary);min-height:18px}
-.dsh-pins-card .meta .time{margin-left:auto}
-.dsh-pins-card .dot{width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);flex:none}
+/* Body text follows the host's small type scale plus the reader's content-size delta,
+   so zooming the conversation text keeps the pins legible at the same rate. The two
+   line heights are declared once on the card and every clamp below derives from them:
+   a clamp that repeats a hard-coded 17px would drift the moment the scale changes. */
+.dsh-pins-card{position:relative;box-sizing:border-box;width:100%;margin:0 0 6px;padding:8px 10px;
+  border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md);
+  background:var(--dsw-alias-bg-layer-1);text-align:left;font:inherit;color:inherit;cursor:pointer;
+  --dsh-pins-txt-line:calc(var(--dsw-font-xxs-12-line-height,18px) + var(--dsh-content-font-delta,0px));
+  --dsh-pins-code-line:calc(var(--dsw-font-markdown-code-block-small-line-height,16px) + var(--dsh-code-font-delta,0px));
+  transition:background-color 160ms cubic-bezier(0,0,.2,1),border-color 160ms cubic-bezier(0,0,.2,1),
+    box-shadow 160ms cubic-bezier(0,0,.2,1)}
+.dsh-pins-card:hover{border-color:var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-interactive-bg-hover);box-shadow:var(--dsw-elevation-soft)}
+/* The group for the conversation on screen is marked, not shouted: the border is the
+   brand ink mixed into the ordinary border, so ten cards do not become ten black frames. */
+.dsh-pins-card[data-current]{border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 28%,var(--dsw-alias-border-l2))}
+.dsh-pins-card .meta{position:relative;display:flex;align-items:center;gap:6px;margin-bottom:4px;
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:var(--dsw-font-xxxs-11-line-height,14px);
+  color:var(--dsw-alias-label-secondary);min-height:18px}
+.dsh-pins-card .meta .time{margin-left:auto;flex:none;color:var(--dsw-alias-label-secondary);
+  font-variant-numeric:tabular-nums}
+.dsh-pins-card .dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);flex:none}
 .dsh-pins-card[data-kind="user"] .dot{background:var(--dsw-alias-brand-primary)}
 .dsh-pins-card .txt{white-space:pre-wrap;overflow-wrap:anywhere;overflow:hidden;
-  max-height:calc(3 * (17px + var(--dsh-content-font-delta, 0px)));
-  font-size:12px;line-height:calc(17px + var(--dsh-content-font-delta, 0px))}
+  max-height:calc(3 * var(--dsh-pins-txt-line));
+  font-size:var(--dsw-font-xxs-12-font-size,12px);line-height:var(--dsh-pins-txt-line);
+  text-wrap:pretty}
 /* Expanded: the card is the height owner, the text becomes the scrolling window. */
-.dsh-pins-card[data-open]{display:flex;flex-direction:column;max-height:min(60cqh, 420px)}
+.dsh-pins-card[data-open]{display:flex;flex-direction:column;max-height:min(60cqh, 420px);
+  border-color:var(--dsw-alias-border-l2);box-shadow:var(--dsw-elevation-soft)}
 .dsh-pins-card[data-open] .txt{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
   max-height:none;cursor:text;
   /* The gutter that keeps the wheel on the list belongs to the CARD, so it is a margin
      here and never padding on the scroller: padding would belong to the scroller and
      the wheel over it would keep scrolling the text. */
-  margin-right:16px}
+  margin-right:16px;scrollbar-width:thin;
+  scrollbar-color:var(--dsw-alias-scrollbar-bg-l2) transparent}
 .dsh-pins-card[data-open] .txt.is-open{max-height:none}
 .dsh-pins-card[data-open] .tagrow,.dsh-pins-card[data-open] .tags,.dsh-pins-card[data-open] .meta{flex:none}
-@media (prefers-reduced-motion:reduce){.dsh-pins-card,.dsh-pins-card .txt{transition:none}}
 /* Code keeps its own layout: no collapsing of indentation, monospace metrics. */
 .dsh-pins-card .txt-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  font-size:11.5px;line-height:calc(16px + var(--dsh-content-font-delta, 0px));
+  font-size:var(--dsw-font-markdown-code-block-small-font-size,11px);line-height:var(--dsh-pins-code-line);
   white-space:pre;overflow-x:hidden;
-  max-height:calc(3 * (16px + var(--dsh-content-font-delta, 0px)))}
-.dsh-pins-card[data-lines="1"] .txt{max-height:calc(1 * (17px + var(--dsh-content-font-delta, 0px)))}
-.dsh-pins-card[data-lines="2"] .txt{max-height:calc(2 * (17px + var(--dsh-content-font-delta, 0px)))}
-.dsh-pins-card[data-lines="1"] .txt-code{max-height:calc(1 * (16px + var(--dsh-content-font-delta, 0px)))}
-.dsh-pins-card[data-lines="2"] .txt-code{max-height:calc(2 * (16px + var(--dsh-content-font-delta, 0px)))}
+  max-height:calc(3 * var(--dsh-pins-code-line))}
+.dsh-pins-card[data-lines="1"] .txt{max-height:calc(1 * var(--dsh-pins-txt-line))}
+.dsh-pins-card[data-lines="2"] .txt{max-height:calc(2 * var(--dsh-pins-txt-line))}
+.dsh-pins-card[data-lines="1"] .txt-code{max-height:calc(1 * var(--dsh-pins-code-line))}
+.dsh-pins-card[data-lines="2"] .txt-code{max-height:calc(2 * var(--dsh-pins-code-line))}
 .dsh-pins-card .meta .warn{color:var(--dsw-alias-state-warn-primary)}
-.dsh-pins-card .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.dsh-pins-card .tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
 /* Filter chips: ellipsised, because the row must stay one line and the tooltip
    carries the full name. The tag *manager* deliberately does the opposite. */
-.dsh-pins-root .tag{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:1px 6px;
-  border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);
-  font-size:10px;cursor:pointer}
-.dsh-pins-root .tag:hover{color:var(--dsw-alias-label-primary)}
-.dsh-pins-root .tag[data-on]{background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
+.dsh-pins-root .tag{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  padding:2px 8px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover-solid);
+  color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:16px;cursor:pointer}
+.dsh-pins-root .tag:hover{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 8%,var(--dsw-alias-interactive-bg-hover-solid));
+  color:var(--dsw-alias-label-primary)}
+.dsh-pins-root .tag[data-on]{background:var(--dsw-alias-brand-primary);
+  color:var(--dsw-alias-label-primary-foreground)}
 .dsh-pins-root .tagbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
-.dsh-pins-root .tagbar-chips{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
-.dsh-pins-root .tagbar-clear{flex:none;height:20px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
-  border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10px;cursor:pointer}
-.dsh-pins-root .tagbar-clear:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2)}
+.dsh-pins-root .tagbar-chips{display:flex;flex-wrap:wrap;gap:5px;min-width:0}
+.dsh-pins-root .tagbar-clear{flex:none;height:22px;padding:0 9px;border:1px solid var(--dsw-alias-border-l2);
+  border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1;cursor:pointer}
+.dsh-pins-root .tagbar-clear:hover{color:var(--dsw-alias-label-primary);
+  background:var(--dsw-alias-interactive-bg-hover)}
 
 /* Collapsible tag manager: one row per tag, full name, trash beside it. */
-.dsh-pins-root .tagmgr{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
-.dsh-pins-root .tagmgr-head{display:flex;align-items:center;gap:6px;width:100%;height:26px;padding:0 8px;border:none;
-  border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;cursor:pointer;text-align:left}
-.dsh-pins-root .tagmgr-head:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2)}
-.dsh-pins-root .tagmgr-head .chev{width:10px;flex:none;color:var(--dsw-alias-label-tertiary)}
-.dsh-pins-root .tagmgr-head .badge{margin-left:auto;padding:0 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);
-  color:var(--dsw-alias-label-tertiary);font-size:10px}
-.dsh-pins-root .tagmgr-body{display:flex;flex-direction:column;gap:1px;padding:2px 4px 6px}
+.dsh-pins-root .tagmgr{border:1px solid var(--dsw-alias-border-l1);
+  border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1)}
+.dsh-pins-root .tagmgr-head{display:flex;align-items:center;gap:6px;width:100%;height:28px;padding:0 10px;
+  border:none;border-radius:var(--dsw-radius-md);background:transparent;
+  color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);cursor:pointer;text-align:left}
+.dsh-pins-root .tagmgr-head:hover{color:var(--dsw-alias-label-primary);
+  background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-root .tagmgr-head .chev{width:10px;flex:none;color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1}
+.dsh-pins-root .tagmgr-head .badge{margin-left:auto;padding:0 6px;border-radius:999px;
+  background:var(--dsw-alias-interactive-bg-hover-solid);color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:16px;font-variant-numeric:tabular-nums}
+.dsh-pins-root .tagmgr-body{display:flex;flex-direction:column;gap:1px;padding:4px 4px 8px}
 /* The panel-level manager is bounded and scrolls on its own. Overflow on a flex
    item also gives it an automatic minimum size of zero, so a long tag list can
    never push the pin list out of reach. The important flag is what re-establishes
    that bound after a drag writes an inline height on the manager root. */
 .dsh-pins-root .tagmgr-scroll{overflow-y:auto;overscroll-behavior:contain;
-  max-height:var(--dsh-pins-mgr-height, 200px) !important}
-.dsh-pins-root .tagmgr-resize{display:block;width:100%;height:10px;margin-top:2px;padding:0;border:none;background:transparent;
-  cursor:ns-resize;user-select:none;touch-action:none}
-.dsh-pins-root .tagmgr-resize::after{content:'';display:block;width:32px;height:3px;margin:0 auto;border-radius:999px;
-  background:var(--dsw-alias-border-l2)}
+  max-height:var(--dsh-pins-mgr-height, 200px) !important;scrollbar-width:thin;
+  scrollbar-color:var(--dsw-alias-scrollbar-bg-l2) transparent}
+.dsh-pins-root .tagmgr-resize{display:block;width:100%;height:10px;margin-top:2px;padding:0;border:none;
+  background:transparent;cursor:ns-resize;user-select:none;touch-action:none}
+.dsh-pins-root .tagmgr-resize::after{content:'';display:block;width:32px;height:3px;margin:0 auto;
+  border-radius:999px;background:var(--dsw-alias-border-l2)}
 .dsh-pins-root .tagmgr-resize:hover::after{background:var(--dsw-alias-label-tertiary)}
-.dsh-pins-root .tagmgr-row{display:flex;align-items:center;gap:6px;min-height:24px;padding:0 4px;border-radius:6px}
-.dsh-pins-root .tagmgr-row:hover{background:var(--dsw-alias-bg-layer-2)}
-.dsh-pins-root .tagmgr-row[data-active]{background:var(--dsw-alias-bg-layer-2)}
-.dsh-pins-root .tagmgr-name{flex:1;min-width:0;word-break:break-all;padding:2px 0;text-align:left;font-size:11px;
-  color:var(--dsw-alias-label-primary);background:transparent;border:none;font-family:inherit}
+.dsh-pins-root .tagmgr-row{display:flex;align-items:center;gap:6px;min-height:26px;padding:0 6px;
+  border-radius:var(--dsw-radius-sm)}
+.dsh-pins-root .tagmgr-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-root .tagmgr-row[data-active]{background:var(--dsw-alias-interactive-bg-hover-solid)}
+.dsh-pins-root .tagmgr-name{flex:1;min-width:0;word-break:break-all;padding:2px 0;text-align:left;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);color:var(--dsw-alias-label-primary);
+  background:transparent;border:none;font-family:inherit}
 .dsh-pins-root .tagmgr-name.filter{cursor:pointer}
 .dsh-pins-root .tagmgr-name.filter:hover{color:var(--dsw-alias-brand-primary)}
-.dsh-pins-root .tagmgr-count{flex:none;font-size:10px;color:var(--dsw-alias-label-tertiary)}
-.dsh-pins-root .tagmgr-del{flex:none;width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;
-  border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;cursor:pointer}
-.dsh-pins-root .tagmgr-del:hover{background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-state-error-primary)}
-.dsh-pins-root .tagmgr-hint{padding:4px 4px 0;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1.5}
-.dsh-pins-root .tagmgr-empty{padding:4px;color:var(--dsw-alias-label-tertiary);font-size:11px}
+.dsh-pins-root .tagmgr-count{flex:none;font-size:var(--dsw-font-xxxs-11-font-size,11px);
+  color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+.dsh-pins-root .tagmgr-del{flex:none;width:22px;height:22px;display:inline-flex;align-items:center;
+  justify-content:center;border:none;border-radius:var(--dsw-radius-sm);background:transparent;
+  color:var(--dsw-alias-label-tertiary);font:inherit;font-size:var(--dsw-font-xxxs-11-font-size,11px);
+  line-height:1;cursor:pointer}
+.dsh-pins-root .tagmgr-del:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent);
+  color:var(--dsw-alias-state-error-primary)}
+.dsh-pins-root .tagmgr-hint{padding:4px 4px 0;color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1.6}
+.dsh-pins-root .tagmgr-empty{padding:4px;color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xxs-12-font-size,12px)}
 
 /* The card's tag editor: a line saying how to delete, the chips, then the input on
    a line of its own so no number of tags can push it off the card. */
-.dsh-pins-root .tagrow-head{color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1.5}
-.dsh-pins-root .tagrow-chips{display:flex;flex-wrap:wrap;gap:4px}
+.dsh-pins-root .tagrow-head{color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1.5}
+.dsh-pins-root .tagrow-chips{display:flex;flex-wrap:wrap;gap:5px}
 .dsh-pins-root .tagrow-chips .tag{border:none;font-family:inherit}
 .dsh-pins-card .ops{position:absolute;top:0;right:0;display:none;gap:2px;align-items:center;
-  height:100%;padding-left:6px;background:var(--dsw-alias-bg-layer-1);border-radius:6px}
+  height:100%;padding-left:6px;background:var(--dsw-alias-bg-layer-1);border-radius:var(--dsw-radius-sm)}
 .dsh-pins-card:hover .ops,.dsh-pins-card:focus-within .ops{display:flex;background:var(--dsw-alias-bg-layer-2)}
 /* An expanded card keeps its controls in place: the passage below it is a jump target,
    so the editor's own entry point must not depend on the pointer staying over the card. */
@@ -1906,27 +2024,52 @@ window.__ModuleLoader__.load({
    gaps between buttons. */
 .dsh-pins-card:hover .meta .time,.dsh-pins-card:focus-within .meta .time,.dsh-pins-card[data-open] .meta .time{visibility:hidden}
 .dsh-pins-card .ops button{width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;
-  border:none;border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);
-  font:inherit;font-size:12px;cursor:pointer}
-.dsh-pins-card .ops button:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}
+  border:none;border-radius:var(--dsw-radius-sm);background:transparent;
+  color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);line-height:1;cursor:pointer}
+.dsh-pins-card .ops button:hover{color:var(--dsw-alias-label-primary);
+  background:var(--dsw-alias-interactive-bg-hover)}
 .dsh-pins-card .tagrow{display:flex;flex-direction:column;gap:6px;margin-top:6px}
-.dsh-pins-card .tagrow input{width:100%;box-sizing:border-box;height:26px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
-  border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none}
-.dsh-pins-root .empty{margin:22px 14px;color:var(--dsw-alias-label-tertiary);line-height:1.8;text-align:center}
-.dsh-pins-root .empty b{display:block;margin-bottom:6px;color:var(--dsw-alias-label-secondary)}
-.dsh-pins-root .empty kbd{padding:1px 5px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;
-  background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px}
-.dsh-pins-root .note{margin:0;color:var(--dsw-alias-state-warn-primary);font-size:11px;line-height:1.6}
-.dsh-pins-root .storage-warn{padding:6px 8px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:7px;
-  background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:1.6}
-.dsh-pins-note{position:fixed;left:50%;bottom:72px;transform:translateX(-50%);z-index:30;padding:6px 12px;
-  border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-overlay);
-  color:var(--dsw-alias-label-secondary);font-size:12px;font-family:inherit;pointer-events:none}
-.dsh-pins-crash{position:fixed;right:18px;bottom:64px;z-index:30;max-width:280px;padding:6px 10px;
-  border:1px solid var(--dsw-alias-state-error-primary);border-radius:8px;background:var(--dsw-alias-bg-overlay);
-  color:var(--dsw-alias-state-error-primary);font-size:11px;font-family:inherit;pointer-events:auto}
+.dsh-pins-card .tagrow input{width:100%;box-sizing:border-box;height:28px;padding:0 8px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none;
+  transition:border-color 140ms cubic-bezier(0,0,.2,1),box-shadow 140ms cubic-bezier(0,0,.2,1)}
+.dsh-pins-card .tagrow input:focus{border-color:var(--dsw-alias-brand-primary);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent)}
+.dsh-pins-root .empty{margin:28px 16px;color:var(--dsw-alias-label-secondary);line-height:1.8;
+  text-align:center;font-size:var(--dsw-font-xs-13-font-size,13px)}
+.dsh-pins-root .empty b{display:block;margin-bottom:8px;color:var(--dsw-alias-label-primary);
+  font:var(--dsw-font-xs-strong-13)}
+.dsh-pins-root .empty kbd{display:inline-block;padding:0 5px;border:1px solid var(--dsw-alias-border-l2);
+  border-radius:var(--dsw-radius-xs);background:var(--dsw-alias-interactive-bg-hover-solid);
+  color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:18px}
+.dsh-pins-root .note{margin:0;color:var(--dsw-alias-state-warn-primary);
+  font-size:var(--dsw-font-xxs-12-font-size,12px);line-height:1.6}
+.dsh-pins-root .storage-warn{padding:7px 9px;border:1px solid var(--dsw-alias-state-error-primary);
+  border-radius:var(--dsw-radius-sm);
+  background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 8%,transparent);
+  color:var(--dsw-alias-state-error-primary);font-size:var(--dsw-font-xxs-12-font-size,12px);line-height:1.6}
+/* The floating surfaces sit above conversation text, so they carry the host's
+   prominent elevation instead of a hand-mixed black shadow that would go muddy on
+   the dark theme. */
+.dsh-pins-note{position:fixed;left:50%;bottom:72px;transform:translateX(-50%);z-index:30;
+  max-width:min(480px, calc(100vw - 32px));padding:7px 14px;border-radius:var(--dsw-radius-md);
+  border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-overlay);
+  color:var(--dsw-alias-label-primary);font-size:var(--dsw-font-xxs-12-font-size,12px);
+  line-height:var(--dsw-font-xxs-12-line-height,18px);font-family:inherit;text-align:center;
+  box-shadow:var(--dsw-elevation-prominent);pointer-events:none;
+  animation:dsh-pins-note-in 200ms cubic-bezier(.215,.61,.355,1)}
+@keyframes dsh-pins-note-in{
+  from{opacity:0;transform:translate(-50%, 4px)}
+  to{opacity:1;transform:translate(-50%, 0)}}
+.dsh-pins-crash{position:fixed;right:18px;bottom:64px;z-index:30;max-width:280px;padding:8px 12px;
+  border:1px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-md);
+  background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-state-error-primary);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1.6;font-family:inherit;
+  box-shadow:var(--dsw-elevation-prominent);pointer-events:auto}
 
-[data-dsh-pins-flash]{animation:dsh-pins-flash 2s ease-out;border-radius:8px}
+[data-dsh-pins-flash]{animation:dsh-pins-flash 2s ease-out;border-radius:var(--dsw-radius-sm)}
 @keyframes dsh-pins-flash{
   0%{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 26%,transparent)}
   100%{background:transparent}}
@@ -1937,26 +2080,59 @@ window.__ModuleLoader__.load({
   text-decoration:underline;text-decoration-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 60%,transparent);
   text-decoration-thickness:1px;text-underline-offset:3px}
 mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 22%,transparent);color:inherit;
-  border-bottom:1px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 60%,transparent);border-radius:3px}
+  border-bottom:1px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 60%,transparent);
+  border-radius:var(--dsw-radius-xs)}
 
 .dsh-pins-return{position:fixed;right:18px;bottom:18px;z-index:30;display:flex;align-items:center;gap:6px;
-  padding:6px 11px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;
-  background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;
-  cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.2);pointer-events:auto}
-.dsh-pins-return:hover{background:var(--dsw-alias-bg-layer-2)}
+  padding:7px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;
+  background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);cursor:pointer;
+  box-shadow:var(--dsw-elevation-prominent);pointer-events:auto}
+.dsh-pins-return:hover{background:var(--dsw-alias-interactive-bg-hover-solid)}
 .dsh-pins-bar .btn-quote{color:var(--dsw-alias-label-secondary)}
 
 /* Left sidebar footer action: a control beside Settings that opens the right column's
    pin tab. The host decides the row height, so nothing here fixes one. */
 .dsh-pins-entry{position:relative;display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 8px;
-  border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);
-  font:inherit;font-size:12px;font-family:inherit;cursor:pointer;white-space:nowrap}
-.dsh-pins-entry:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-.dsh-pins-entry.is-flash{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+  border:none;border-radius:var(--dsw-radius-sm);background:transparent;
+  color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);font-family:inherit;cursor:pointer;white-space:nowrap}
+.dsh-pins-entry:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.dsh-pins-entry.is-flash{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 10%,transparent);
+  color:var(--dsw-alias-label-primary)}
 .dsh-pins-entry-label{overflow:hidden;text-overflow:ellipsis}
-.dsh-pins-entry-count{min-width:15px;height:15px;padding:0 4px;border-radius:999px;background:var(--dsw-alias-brand-primary);
-  color:var(--dsw-alias-bg-base);font-size:10px;line-height:15px;text-align:center}
-`;
+.dsh-pins-entry-count{min-width:16px;height:16px;padding:0 5px;border-radius:999px;
+  background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-primary-foreground);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:16px;text-align:center;
+  font-variant-numeric:tabular-nums}
+
+/* Keyboard focus is a double ring, not the browser outline: the inner ring is the
+   surface the control sits on, the outer one the host's focus colour. It follows the
+   border radius, which an outline on a 12px-radius card does not. Declared last so it
+   wins over the hover elevation, and only for :focus-visible, so a mouse click never
+   draws it. */
+.dsh-pins-card:focus-visible,
+.dsh-pins-bar button:focus-visible,
+.dsh-pins-root button:focus-visible,
+.dsh-pins-root .tag:focus-visible,
+.dsh-pins-return:focus-visible,
+.dsh-pins-entry:focus-visible{outline:none;
+  box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),
+    0 0 0 4px var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary))}
+
+/* Reduced motion keeps the feedback but drops the movement: the new pin still marks
+   its card with a flat border, and the jump flash becomes a static tint that the
+   existing 2s timer removes. */
+@media (prefers-reduced-motion:reduce){
+  .dsh-pins-bar button,.dsh-pins-root button,.dsh-pins-root .tag,.dsh-pins-entry,
+  .dsh-pins-return,.dsh-pins-card,.dsh-pins-card .txt,.dsh-pins-bar input,
+  .dsh-pins-root .search input,.dsh-pins-card .tagrow input{transition:none}
+  .dsh-pins-card.is-pulse,.dsh-pins-card.is-fresh,.dsh-pins-root .group-block.is-pulse,
+  .dsh-pins-note,[data-dsh-pins-flash]{animation:none}
+  .dsh-pins-card.is-fresh{border-color:var(--dsw-alias-brand-primary);
+    background:color-mix(in srgb,var(--dsw-alias-brand-primary) 10%,transparent)}
+  [data-dsh-pins-flash]{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent)}}
+      `;
       try {
         const element = document.createElement('style');
         element.setAttribute('data-dsh-pins-style', '');
@@ -2498,7 +2674,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         state ? h(Toolbar, { state, onAction }) : null,
         h(ReturnPill, { context }),
         notice !== ''
-          ? h('div', { className: 'dsh-pins-note' }, notice)
+          ? h('div', { className: 'dsh-pins-note', role: 'status', 'aria-live': 'polite' }, notice)
           : null,
       );
     }
@@ -3990,6 +4166,51 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         return () => PINS_EVENTS.removeEventListener('chip-reveal', onReveal);
       }, []);
 
+      // A pin that was just created flashes once where it landed. A panel opened by
+      // that same action mounts after the event, so the newest id is also checked here
+      // on mount. The card's own node carries the class, exactly like the chip reveal
+      // above, which keeps every card free of a per-render "am I new" prop.
+      React.useEffect(() => {
+        let frame = 0;
+        let timer = 0;
+        const flashCard = (pinId) => {
+          let tries = 0;
+          const paint = () => {
+            let node = null;
+            for (const candidate of document.querySelectorAll('.dsh-pins-card')) {
+              if (candidate.getAttribute('data-pin-id') === pinId) {
+                node = candidate;
+                break;
+              }
+            }
+            if (!node) {
+              // Still rendering, or the pin is hidden by a search or tag filter: a card
+              // that is not on screen is not a failure, so this stays quiet.
+              if (tries < 40) {
+                tries += 1;
+                frame = window.requestAnimationFrame(paint);
+              }
+              return;
+            }
+            node.classList.add('is-fresh');
+            window.clearTimeout(timer);
+            timer = window.setTimeout(() => node.classList.remove('is-fresh'), 1300);
+          };
+          paint();
+        };
+        const onAdded = (event) => {
+          const pinId = String(event.detail?.pinId ?? '');
+          if (pinId !== '') flashCard(pinId);
+        };
+        PINS_EVENTS.addEventListener('pin-added', onAdded);
+        if (lastPinAdded !== null && Date.now() - lastPinAdded.at < 2000) flashCard(lastPinAdded.pinId);
+        return () => {
+          PINS_EVENTS.removeEventListener('pin-added', onAdded);
+          window.cancelAnimationFrame(frame);
+          window.clearTimeout(timer);
+        };
+      }, []);
+
       /**
        * Put one passage into the composer, from whichever view the card was in.
        *
@@ -4494,7 +4715,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               activeTags: Object.fromEntries([...tagFilter].map((tag) => [tag, true])),
             })
           : null,
-        notice !== '' ? h('div', { className: 'note' }, notice) : null,
+        notice !== ''
+          ? h('div', { className: 'note', role: 'status', 'aria-live': 'polite' }, notice)
+          : null,
       );
 
       /** Name hits, listed above the pins and marked as conversations rather than pins. */
