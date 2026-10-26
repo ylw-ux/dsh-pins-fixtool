@@ -3098,16 +3098,21 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * @returns the panel's outcome, or `{ ok: false, reason, message }`.
      */
     async function requestQuote(anchor, text, origin, alsoPin, tag, wake) {
+      const wanted = anchor?.sessionId ?? '';
       // No wake-up on the first attempt: a panel that is already mounted answers in the
       // same tick, and opening a sidebar the user did not ask for would be a visible change
       // for no reason.
       const first = await attemptQuote(anchor, text, origin, alsoPin, tag, 400);
-      if (first.reason !== 'no-panel') return first;
+      // `session-mismatch` means a panel is mounted but sitting on another conversation. It
+      // must not insert there (the editor is not on screen and the pin would be filed under
+      // the wrong conversation), and opening the tab is exactly what lets a kept-mounted
+      // panel follow the Session that is visible — so it is retried like a missing panel.
+      if (first.reason !== 'no-panel' && first.reason !== 'session-mismatch') return first;
       const problem = typeof wake === 'function' ? wake() : '没有打开右侧栏的入口';
       if (problem !== '') return { ok: false, reason: 'no-panel', message: problem };
       // React needs a frame or two after `openTab` before the panel's listener exists, so
       // ping until it answers rather than sleeping for a guessed duration.
-      await waitForPanel(1500);
+      await waitForPanel(1500, wanted);
       return attemptQuote(anchor, text, origin, alsoPin, tag, 1500);
     }
 
@@ -3144,7 +3149,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * *quote* as the retry would: two mounted panels, or one that answers on both attempts,
      * would paste the passage twice — which is why readiness is probed with something inert.
      */
-    function waitForPanel(timeoutMs) {
+    function waitForPanel(timeoutMs, sessionId) {
       return new Promise((resolve) => {
         let settled = false;
         const finish = () => {
@@ -3155,7 +3160,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           PINS_EVENTS.removeEventListener('panel-ready', onReady);
           resolve();
         };
-        const onReady = () => finish();
+        // A panel from another Session cannot serve this request: it would write into an
+        // editor that is not on screen and file the pin under the wrong conversation. Only a
+        // matching answer ends the wait; a panel that reports no Session still counts.
+        const onReady = (event) => {
+          const ready = event?.detail?.sessionId;
+          if (typeof ready === 'string' && ready !== '' && ready !== sessionId) return;
+          finish();
+        };
         const timer = window.setTimeout(finish, timeoutMs);
         PINS_EVENTS.addEventListener('panel-ready', onReady);
         const ping = () => {
@@ -4057,12 +4069,27 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
          * sent to a panel that is still mounting is heard by nobody — and retrying the quote
          * itself could insert it twice. A ping carries no payload, so a late answer is inert.
          */
-        const onPing = () => PINS_EVENTS.dispatchEvent(new Event('panel-ready'));
+        const onPing = () =>
+          PINS_EVENTS.dispatchEvent(new CustomEvent('panel-ready', { detail: { sessionId } }));
         const onRequest = async (event) => {
           const detail = event.detail ?? {};
           const answer = (payload) => {
             PINS_EVENTS.dispatchEvent(new CustomEvent('quote-done', { detail: { token: detail.token, ...payload } }));
           };
+          // This panel can only act on its own Session: `insertIntoComposer` writes into this
+          // panel's editor and `store.add` files the pin under this panel's id. A kept-mounted
+          // tab that has not followed a Session switch therefore did both in the wrong place —
+          // the quote landed in a composer nobody could see, and the pin surfaced under the
+          // other conversation's title. Refuse, so the bar waits for a panel that matches.
+          const wanted = typeof detail.sessionId === 'string' ? detail.sessionId : '';
+          if (wanted !== '' && wanted !== sessionId) {
+            answer({
+              ok: false,
+              reason: 'session-mismatch',
+              message: '右侧栏还停在另一个会话上（切回该会话，或关掉再打开「固定片段」）',
+            });
+            return;
+          }
           try {
             // "Quote and pin" is one gesture: the pin is written first, so a quote that
             // fails to insert still leaves the passage in the panel rather than nowhere.
