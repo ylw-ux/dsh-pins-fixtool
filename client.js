@@ -1900,6 +1900,9 @@ window.__ModuleLoader__.load({
   background:var(--dsw-alias-bg-layer-1);text-align:left;font:inherit;color:inherit;cursor:pointer;
   --dsh-pins-txt-line:calc(var(--dsw-font-xxs-12-line-height,18px) + var(--dsh-content-font-delta,0px));
   --dsh-pins-code-line:calc(var(--dsw-font-markdown-code-block-small-line-height,16px) + var(--dsh-code-font-delta,0px));
+  /* Lets the open clamp below interpolate between the collapsed three-line length and
+     the content's own height; browsers without it still transition between lengths. */
+  interpolate-size:allow-keywords;
   transition:background-color 160ms cubic-bezier(0,0,.2,1),border-color 160ms cubic-bezier(0,0,.2,1),
     box-shadow 160ms cubic-bezier(0,0,.2,1)}
 .dsh-pins-card:hover{border-color:var(--dsw-alias-border-l2);
@@ -1917,18 +1920,30 @@ window.__ModuleLoader__.load({
 .dsh-pins-card .txt{white-space:pre-wrap;overflow-wrap:anywhere;overflow:hidden;
   max-height:calc(3 * var(--dsh-pins-txt-line));
   font-size:var(--dsw-font-xxs-12-font-size,12px);line-height:var(--dsh-pins-txt-line);
-  text-wrap:pretty}
+  text-wrap:pretty;
+  /* The card only changes height here, so this is the one height transition. */
+  transition:max-height 240ms cubic-bezier(.22,1,.36,1)}
 /* Expanded: the card is the height owner, the text becomes the scrolling window. */
 .dsh-pins-card[data-open]{display:flex;flex-direction:column;max-height:min(60cqh, 420px);
   border-color:var(--dsw-alias-border-l2);box-shadow:var(--dsw-elevation-soft)}
 .dsh-pins-card[data-open] .txt{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;
-  max-height:none;cursor:text;
+  cursor:text;
   /* The gutter that keeps the wheel on the list belongs to the CARD, so it is a margin
      here and never padding on the scroller: padding would belong to the scroller and
      the wheel over it would keep scrolling the text. */
   margin-right:16px;scrollbar-width:thin;
   scrollbar-color:var(--dsw-alias-scrollbar-bg-l2) transparent}
-.dsh-pins-card[data-open] .txt.is-open{max-height:none}
+/* The open clamp is the content's own height, limited to the same cap the card uses, so
+   a four-line note and a forty-line note take the same time to open instead of racing
+   to a fixed cap and stopping early. calc-size() is the only way to name "content
+   height" as a length; the plain cap above it is the fallback for browsers without it,
+   and interpolate-size on the card turns the jump from three lines into a transition.
+   The .is-open class owns the specificity: the data-lines clamps below are equally
+   specific and later in the sheet, exactly why the old max-height:none lived here. */
+.dsh-pins-card[data-open] .txt.is-open{
+  max-height:min(60cqh, 420px);
+  max-height:calc-size(max-content, min(size, 60cqh, 420px));
+  transition-duration:320ms}
 .dsh-pins-card[data-open] .tagrow,.dsh-pins-card[data-open] .tags,.dsh-pins-card[data-open] .meta{flex:none}
 /* Code keeps its own layout: no collapsing of indentation, monospace metrics. */
 .dsh-pins-card .txt-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
@@ -2125,8 +2140,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
    existing 2s timer removes. */
 @media (prefers-reduced-motion:reduce){
   .dsh-pins-bar button,.dsh-pins-root button,.dsh-pins-root .tag,.dsh-pins-entry,
-  .dsh-pins-return,.dsh-pins-card,.dsh-pins-card .txt,.dsh-pins-bar input,
-  .dsh-pins-root .search input,.dsh-pins-card .tagrow input{transition:none}
+  .dsh-pins-return,.dsh-pins-card,.dsh-pins-card .txt,.dsh-pins-card[data-open] .txt.is-open,
+  .dsh-pins-bar input,.dsh-pins-root .search input,.dsh-pins-card .tagrow input{transition:none}
   .dsh-pins-card.is-pulse,.dsh-pins-card.is-fresh,.dsh-pins-root .group-block.is-pulse,
   .dsh-pins-note,[data-dsh-pins-flash]{animation:none}
   .dsh-pins-card.is-fresh{border-color:var(--dsw-alias-brand-primary);
