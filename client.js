@@ -3203,10 +3203,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      */
     async function requestQuote(anchor, text, origin, alsoPin, tag, wake) {
       const wanted = anchor?.sessionId ?? '';
+      // One id for the whole gesture. An attempt can time out *after* a panel has already
+      // inserted — the answer only arrives late — so the retry has to be recognisable as the
+      // same request, or the passage is pasted twice.
+      const requestId = `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       // No wake-up on the first attempt: a panel that is already mounted answers in the
       // same tick, and opening a sidebar the user did not ask for would be a visible change
       // for no reason.
-      const first = await attemptQuote(anchor, text, origin, alsoPin, tag, 400);
+      const first = await attemptQuote(anchor, text, origin, alsoPin, tag, 400, requestId, wanted);
       // `session-mismatch` means a panel is mounted but sitting on another conversation. It
       // must not insert there (the editor is not on screen and the pin would be filed under
       // the wrong conversation), and opening the tab is exactly what lets a kept-mounted
@@ -3217,14 +3221,23 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // React needs a frame or two after `openTab` before the panel's listener exists, so
       // ping until it answers rather than sleeping for a guessed duration.
       await waitForPanel(1500, wanted);
-      return attemptQuote(anchor, text, origin, alsoPin, tag, 1500);
+      return attemptQuote(anchor, text, origin, alsoPin, tag, 1500, requestId, wanted);
     }
 
-    /** One `quote-req` round trip. Resolves `{ reason: 'no-panel' }` when nobody answers. */
-    function attemptQuote(anchor, text, origin, alsoPin, tag, timeoutMs) {
+    /**
+     * One `quote-req` round trip.
+     *
+     * Resolves `{ reason: 'no-panel' }` when nobody answers. A refusal from a panel that is
+     * showing another Session does **not** settle the attempt: several panels can be mounted
+     * at once (a kept-mounted tab per Session), and letting the stale one win the race is how
+     * a quote that was in fact inserted still reported 「还停在另一个会话上」. The refusal is
+     * remembered so the final message can still explain that case.
+     */
+    function attemptQuote(anchor, text, origin, alsoPin, tag, timeoutMs, requestId, wanted) {
       return new Promise((resolve) => {
         const token = `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
         let settled = false;
+        let refusal = null;
         const finish = (outcome) => {
           if (settled) return;
           settled = true;
@@ -3233,14 +3246,23 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           resolve(outcome);
         };
         const onDone = (event) => {
-          if (event.detail?.token !== token) return;
-          finish(event.detail);
+          const detail = event.detail ?? {};
+          if (detail.token !== token) return;
+          const from = typeof detail.sessionId === 'string' ? detail.sessionId : '';
+          if (from !== '' && wanted !== '' && from !== wanted) {
+            refusal = detail;
+            return;
+          }
+          finish(detail);
         };
-        const timer = window.setTimeout(() => finish({ ok: false, reason: 'no-panel' }), timeoutMs);
+        const timer = window.setTimeout(
+          () => finish(refusal ?? { ok: false, reason: 'no-panel' }),
+          timeoutMs,
+        );
         PINS_EVENTS.addEventListener('quote-done', onDone);
         PINS_EVENTS.dispatchEvent(
           new CustomEvent('quote-req', {
-            detail: { token, sessionId: anchor?.sessionId ?? '', anchor, text, origin, alsoPin: alsoPin === true, tag },
+            detail: { token, requestId, sessionId: wanted, anchor, text, origin, alsoPin: alsoPin === true, tag },
           }),
         );
       });
@@ -4049,6 +4071,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const [notice, setNotice] = React.useState('');
       const [noticeIsError, setNoticeIsError] = React.useState(false);
       const noticeTimer = React.useRef(0);
+      /** Answers already produced for one gesture; a retried request must not paste twice. */
+      const handledRequests = React.useRef(new Map());
       const [sort, setSort] = React.useState(() => store.getSort());
       /** Session groups the user folded shut, and the one a search result just revealed. */
       const [collapsed, setCollapsed] = React.useState(() => new Set());
@@ -4181,8 +4205,24 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           PINS_EVENTS.dispatchEvent(new CustomEvent('panel-ready', { detail: { sessionId } }));
         const onRequest = async (event) => {
           const detail = event.detail ?? {};
+          const requestId = typeof detail.requestId === 'string' ? detail.requestId : '';
+          // Every answer says which Session produced it, so the bar can ignore a refusal
+          // from a panel that is merely still mounted for another conversation.
+          const reply = (payload) => {
+            PINS_EVENTS.dispatchEvent(
+              new CustomEvent('quote-done', {
+                detail: { token: detail.token, requestId, sessionId, ...payload },
+              }),
+            );
+          };
           const answer = (payload) => {
-            PINS_EVENTS.dispatchEvent(new CustomEvent('quote-done', { detail: { token: detail.token, ...payload } }));
+            if (requestId !== '') {
+              handledRequests.current.set(requestId, payload);
+              if (handledRequests.current.size > 20) {
+                handledRequests.current.delete(handledRequests.current.keys().next().value);
+              }
+            }
+            reply(payload);
           };
           // This panel can only act on its own Session: `insertIntoComposer` writes into this
           // panel's editor and `store.add` files the pin under this panel's id. A kept-mounted
@@ -4191,11 +4231,19 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // other conversation's title. Refuse, so the bar waits for a panel that matches.
           const wanted = typeof detail.sessionId === 'string' ? detail.sessionId : '';
           if (wanted !== '' && wanted !== sessionId) {
-            answer({
+            // Deliberately `reply`, not `answer`: a refusal is not a handled request, so it
+            // is neither replayed nor remembered — the retry must still reach the right panel.
+            reply({
               ok: false,
               reason: 'session-mismatch',
               message: '右侧栏还停在另一个会话上（切回该会话，或关掉再打开「固定片段」）',
             });
+            return;
+          }
+          // The same gesture arrives twice when the bar retries a slow answer. Replaying the
+          // recorded outcome keeps that retry from inserting a second copy of the passage.
+          if (requestId !== '' && handledRequests.current.has(requestId)) {
+            reply(handledRequests.current.get(requestId));
             return;
           }
           try {
