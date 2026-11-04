@@ -18,6 +18,24 @@
  * Failures are reported, never silent: a selection outside a message node, a
  * selection spanning two messages, and a missing Host/Sidebar service each
  * surface as console errors or an in-panel notice instead of a wrong pin.
+ *
+ * Region map — the `//#region` markers below, in file order. Names only, on
+ * purpose: line numbers drift with every edit and a stale number misleads more
+ * than no number at all. Search for the marker name.
+ *
+ *   constants                        plugin ids, storage keys, size limits, host selectors
+ *   storage and store                the persisted shape, dedupe, write-failure status
+ *   selection reading                DOM selection -> anchor (quote, raw quote, offsets, turn)
+ *   jumping back                     locate a pin's passage in a message and scroll/flash it
+ *   persistent pin markers           CSS.highlights / <mark> painting over the transcript
+ *   styles                           the whole stylesheet, injected once (no backticks inside)
+ *   floating action bar              the selection toolbar, its actions and its notices
+ *   tags                             the tag manager (panel side) and its row model
+ *   export                           the markdown outline builder, download and clipboard fallback
+ *   quoting into the composer        build a quote block and hand it to the composer
+ *   reference chips in the composer  the `@固定片段` trigger source and the chip payload codec
+ *   sidebar panel                    the right-tab body: views, filters, sorting, cards
+ *   registration                     slot/tab/service wiring and teardown
  */
 
 window.__ModuleLoader__.load({
@@ -1174,7 +1192,9 @@ window.__ModuleLoader__.load({
      *      against.
      *
      * `widen` grows a short quote to the surrounding word boundaries so a two-word
-     * pin is still findable by eye; the widening is re-verified so it can never
+     * pin is still findable by eye. Only ASCII word fragments are absorbed: widening
+     * across a space is a word-boundary rule, and in Chinese the nearest space is
+     * layout, not a word edge (S15). The widening is re-verified so it can never
      * drift onto neighbouring words.
      *
      * @returns `{ range, verdict }` — `'exact'` for a quote match, `'message'` when
@@ -1236,13 +1256,26 @@ window.__ModuleLoader__.load({
         let length = best.length;
         if (widen && length < 24) {
           const text = view ?? index.raw;
+          // Word-widening assumes a space is a word boundary. That holds for English and
+          // fails for Chinese, where the nearest space is usually layout — after "5.5 ",
+          // after a dash, or between a CJK run and an ASCII word — rather than a word edge.
+          // Pinning 「前面各节」 inside "5.5 与前面各节的关系。" therefore marked
+          // 「与前面各节」: one character stolen from the neighbouring word. Only absorb
+          // ASCII word characters, so `exam` still grows to `example` while a CJK selection
+          // keeps exactly the characters the user picked. The pass below still re-verifies
+          // the resolved range, so a wrong widening degrades to a message mark, never a
+          // misplaced one.
+          const wordChar = /[A-Za-z0-9_'’-]/;
+          const absorbedWords = (slice) => slice !== '' && [...slice].every((ch) => wordChar.test(ch));
           const left = text.lastIndexOf(' ', start);
-          if (left >= 0 && start - left < 8) {
+          if (left >= 0 && start - left < 8 && absorbedWords(text.slice(left + 1, start))) {
             length += start - left - 1;
             start = left + 1;
           }
           const right = text.indexOf(' ', start + length);
-          if (right >= 0 && right - (start + length) < 8) length = right - start;
+          if (right >= 0 && right - (start + length) < 8 && absorbedWords(text.slice(start + length, right))) {
+            length = right - start;
+          }
         }
 
         const range = best.mode === 'raw'
@@ -2078,6 +2111,19 @@ window.__ModuleLoader__.load({
 @keyframes dsh-pins-note-in{
   from{opacity:0;transform:translate(-50%, 4px)}
   to{opacity:1;transform:translate(-50%, 0)}}
+/* An error notice may not retire on a timer, so it needs a way to be dismissed by hand.
+   The row turns into a flex line only in the error case, leaving confirmations as the
+   single centred line they have always been. */
+.dsh-pins-note.is-error{display:flex;align-items:center;gap:8px;pointer-events:auto;
+  border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+.dsh-pins-root .note.is-error{display:flex;align-items:center;gap:6px;
+  color:var(--dsw-alias-state-error-primary)}
+.dsh-pins-note .note-text,.dsh-pins-root .note .note-text{min-width:0}
+.note-x{flex:none;padding:0 3px;border:0;background:none;color:inherit;font:inherit;
+  line-height:1;cursor:pointer;opacity:.7}
+.note-x:hover,.note-x:focus-visible{opacity:1}
+.dsh-pins-note .note-x:focus-visible,.dsh-pins-root .note .note-x:focus-visible{
+  outline:none;box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary))}
 .dsh-pins-crash{position:fixed;right:18px;bottom:64px;z-index:30;max-width:280px;padding:8px 12px;
   border:1px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-md);
   background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-state-error-primary);
@@ -2355,6 +2401,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     function FloatingActions({ context }) {
       const [state, setState] = React.useState(null);
       const [notice, setNotice] = React.useState('');
+      const [noticeIsError, setNoticeIsError] = React.useState(false);
       const stateRef = React.useRef(null);
       const actionRef = React.useRef(() => {});
       stateRef.current = state;
@@ -2411,9 +2458,17 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // A pin changed: redraw the marks, without pretending the DOM moved.
       React.useEffect(() => store.subscribe(() => scheduleMarkers(false)), []);
 
-      const say = React.useCallback((text) => {
+      // Two kinds of message share this one surface. An `info` notice is a confirmation
+      // and may leave on a timer; an `error` notice is the only account of something that
+      // failed, so it stays until another notice replaces it or the user closes it — a
+      // failure that leaves before it is read is the same as one never shown.
+      const noticeTimer = React.useRef(0);
+      const say = React.useCallback((text, kind = 'info') => {
+        // A pending confirmation timer must not cut a new error short.
+        window.clearTimeout(noticeTimer.current);
         setNotice(text);
-        window.setTimeout(() => setNotice(''), 3200);
+        setNoticeIsError(kind === 'error');
+        if (kind !== 'error') noticeTimer.current = window.setTimeout(() => setNotice(''), 3200);
       }, []);
       sayRef.current = say;
 
@@ -2422,7 +2477,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       React.useEffect(() => {
         const onNotice = (event) => {
           if (event.detail?.surface !== 'floating') return;
-          sayRef.current(String(event.detail?.text ?? ''));
+          sayRef.current(
+            String(event.detail?.text ?? ''),
+            event.detail?.kind === 'error' ? 'error' : 'info',
+          );
         };
         PINS_EVENTS.addEventListener('notice', onNotice);
         return () => PINS_EVENTS.removeEventListener('notice', onNotice);
@@ -2521,7 +2579,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
           const target = liveSession();
           if (!target) {
-            say('这个对话还没进入会话上下文，暂时无法固定');
+            say('这个对话还没进入会话上下文，暂时无法固定', 'error');
             return;
           }
 
@@ -2541,7 +2599,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               else if (outcome.ok) say(`${pinned}把引用放进输入框`);
               // Nothing claims a clipboard copy here: this path never writes one, and saying
               // so left the user with an empty clipboard and a notice that insisted otherwise.
-              else say(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
+              else say(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`, 'error');
             });
             return;
           }
@@ -2579,7 +2637,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               }
             } catch (error) {
               console.error('[dsh-pins] 保存固定失败', error);
-              say(`保存失败：${String(error?.message ?? error)}`);
+              say(`保存失败：${String(error?.message ?? error)}`, 'error');
               return;
             }
             dismissBar(action.type === 'tag' ? '固定并打标签之后' : '固定之后');
@@ -2590,12 +2648,16 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             }
             if (store.lastPersisted === false) {
               const status = store.storageStatus();
-              say(status.error || '保存失败：这条没有写入本地存储');
+              say(status.error || '保存失败：这条没有写入本地存储', 'error');
               return;
             }
             const count = store.count(target);
             const panelProblem = showPanel();
-            say(panelProblem !== '' ? `已固定 ${count} 条 · ${panelProblem}` : `已固定 ${count} 条（原文已加标记）`);
+            say(
+              panelProblem !== '' ? `已固定 ${count} 条 · ${panelProblem}` : `已固定 ${count} 条（原文已加标记）`,
+              // the pin itself landed; only the panel failed to open
+              panelProblem !== '' ? 'error' : 'info',
+            );
           }
         },
         [liveSession, say, showPanel, dismissBar],
@@ -2689,7 +2751,28 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         state ? h(Toolbar, { state, onAction }) : null,
         h(ReturnPill, { context }),
         notice !== ''
-          ? h('div', { className: 'dsh-pins-note', role: 'status', 'aria-live': 'polite' }, notice)
+          ? h(
+              'div',
+              {
+                // an error interrupts a screen reader; a confirmation waits its turn
+                className: noticeIsError ? 'dsh-pins-note is-error' : 'dsh-pins-note',
+                role: noticeIsError ? 'alert' : 'status',
+                'aria-live': noticeIsError ? 'assertive' : 'polite',
+              },
+              h('span', { className: 'note-text' }, notice),
+              noticeIsError
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'note-x',
+                      'aria-label': '关闭提示',
+                      onClick: () => setNotice(''),
+                    },
+                    '✕',
+                  )
+                : null,
+            )
           : null,
       );
     }
@@ -2781,8 +2864,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       return clampPanelManagerHeight(value);
     }
 
-    function announce(text) {
-      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'panel' } }));
+    /**
+     * Report something inside the panel.
+     *
+     * `kind: 'error'` marks a message the user must not miss: the panel keeps it until the
+     * next notice replaces it instead of retiring it on a timer.
+     */
+    function announce(text, kind = 'info') {
+      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'panel', kind } }));
     }
 
     /**
@@ -2792,8 +2881,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * a notice about the bar that only lands there is a notice the user never sees.
      * Anything a click in the bar produces therefore goes to the floating surface.
      */
-    function announceHere(text) {
-      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'floating' } }));
+    function announceHere(text, kind = 'info') {
+      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'floating', kind } }));
     }
 
     /**
@@ -3506,6 +3595,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                 : elsewhere > 0
                   ? `这个对话还没有固定片段；你在别的对话里固定过 ${elsewhere} 条，右栏切到「全部」就能看到。`
                   : '这个对话还没有固定过内容：划选一段文字，点浮条上的「固定」就会出现在这里。',
+                // the two empty states are explanations; the first line is a failure
+                problem !== '' ? 'error' : 'info',
             );
             return undefined;
           }
@@ -3516,7 +3607,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           const sessionId = sessionIdOf(pick?.session);
           const pin = sessionId === '' ? undefined : store.get(sessionId, value);
           if (!pin) {
-            announce('这条固定片段已经不在列表里了');
+            announce('这条固定片段已经不在列表里了', 'error');
             return undefined;
           }
           const text = chipText(pin, deps.titleOf(sessionId));
@@ -3565,7 +3656,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           if (!parsed) return false;
           const problem = deps.openPanel();
           if (problem !== '') {
-            announceHere(`打不开固定片段面板：${problem}`);
+            announceHere(`打不开固定片段面板：${problem}`, 'error');
             return true;
           }
           const sessionId = sessionIdOf(session);
@@ -3628,7 +3719,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // Typing only `#` normalized to nothing; say so instead of clearing the box
           // and appearing to have accepted it. This happens in the panel, so the panel
           // is where it belongs.
-          if (typed) announce('标签名不能只有 # 或空格');
+          if (typed) announce('标签名不能只有 # 或空格', 'error');
           return;
         }
         const added = onTagChange('add', tag);
@@ -3641,7 +3732,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         // DOM at all. "Scroll up to load history" would be advice that cannot work there,
         // and switching the conversation is the one thing this panel promised not to do.
         if (foreign) {
-          announce('这条固定片段属于另一个对话，在这里点它不会切换对话；想跳回原文请先切到那个对话。');
+          announce('这条固定片段属于另一个对话，在这里点它不会切换对话；想跳回原文请先切到那个对话。', 'error');
           return;
         }
         let verdict = 'missing';
@@ -3654,7 +3745,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // Through `announce`, not as a bare string in the event detail: the panel reads
           // `detail.text`, so the string form produced an **empty** notice — the click did
           // nothing and said nothing, which is the one outcome this path must not have.
-          announce('这条消息还没加载进当前窗口：先向上滚动加载历史，再点一次。');
+          announce('这条消息还没加载进当前窗口：先向上滚动加载历史，再点一次。', 'error');
           return;
         }
         PINS_EVENTS.dispatchEvent(new Event('jump'));
@@ -3956,6 +4047,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         [updateFilter],
       );
       const [notice, setNotice] = React.useState('');
+      const [noticeIsError, setNoticeIsError] = React.useState(false);
+      const noticeTimer = React.useRef(0);
       const [sort, setSort] = React.useState(() => store.getSort());
       /** Session groups the user folded shut, and the one a search result just revealed. */
       const [collapsed, setCollapsed] = React.useState(() => new Set());
@@ -4179,7 +4272,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           if (!node) {
             // Found by identity, not by luck: say why it is not on screen instead of
             // scrolling somewhere else and calling it a jump.
-            announce('这条固定片段不在当前列表里（可能被搜索、标签筛选或折叠挡住了）');
+            announce('这条固定片段不在当前列表里（可能被搜索、标签筛选或折叠挡住了）', 'error');
             return;
           }
           let scroller = node.parentElement;
@@ -4272,7 +4365,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           ).then((outcome) => {
             if (outcome.viaClipboard) announce('没有可用的输入框，已把引用复制到剪贴板');
             else if (outcome.ok) announce('已把引用放进输入框');
-            else announce(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
+            else announce(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`, 'error');
           });
         },
         [context, sessionId],
@@ -4361,8 +4454,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // at all. Tolerating both shapes means that class of mistake can only ever be
           // wordy, never silent.
           const detail = event.detail;
+          // Timed confirmations and untimed errors share the surface: an error here is
+          // the only account of a click that did nothing, so it waits for the user.
+          window.clearTimeout(noticeTimer.current);
           setNotice(typeof detail === 'string' ? detail : String(detail?.text ?? ''));
-          window.setTimeout(() => setNotice(''), 3600);
+          const isError = typeof detail === 'object' && detail !== null && detail.kind === 'error';
+          setNoticeIsError(isError);
+          if (!isError) noticeTimer.current = window.setTimeout(() => setNotice(''), 3600);
         };
         PINS_EVENTS.addEventListener('filter', onFilter);
         PINS_EVENTS.addEventListener('notice', onNotice);
@@ -4690,7 +4788,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                   list: (id) => store.list(id),
                   titleOf: (id) => readSessionTitle(context, id),
                 });
-                announce(outcome.message);
+                announce(outcome.message, outcome.ok ? 'info' : 'error');
               },
             },
             h('span', { className: 'tool-icon' }, '⤓'),
@@ -4758,7 +4856,27 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             })
           : null,
         notice !== ''
-          ? h('div', { className: 'note', role: 'status', 'aria-live': 'polite' }, notice)
+          ? h(
+              'div',
+              {
+                className: noticeIsError ? 'note is-error' : 'note',
+                role: noticeIsError ? 'alert' : 'status',
+                'aria-live': noticeIsError ? 'assertive' : 'polite',
+              },
+              h('span', { className: 'note-text' }, notice),
+              noticeIsError
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'note-x',
+                      'aria-label': '关闭提示',
+                      onClick: () => setNotice(''),
+                    },
+                    '✕',
+                  )
+                : null,
+            )
           : null,
       );
 

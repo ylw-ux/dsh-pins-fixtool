@@ -69,7 +69,7 @@ Quoting comes in two shapes, and **both carry their content — neither is a poi
 
 ## Compatibility
 
-Verified on: **DSH `0.2.0-rc.2` · Node `24.14.1` · pnpm `12.6.0`**.
+Verified on: **DSH `0.2.1-rc.5` · Node `24.14.1` · pnpm `12.6.0`** (1.0.3 and earlier were verified on `0.2.0-rc.2`).
 
 The package declares **no `peerDependencies` and no `engines.dsh`**, deliberately: it imports no Harness package (the browser half only `require`s `react`; the host half is an empty `apply`), and every host interaction is feature-checked and either degrades or reports clearly. Declaring a version range I cannot verify would only block installs.
 

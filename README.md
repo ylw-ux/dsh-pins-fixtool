@@ -68,7 +68,7 @@ dsh plugin --profile web remove dsh-pins
 
 ## 兼容性
 
-在本机验证过的组合：**DSH `0.2.0-rc.2` · Node `24.14.1` · pnpm `12.6.0`**。
+在本机验证过的组合：**DSH `0.2.1-rc.5` · Node `24.14.1` · pnpm `12.6.0`**（1.0.3 及更早版本验证于 `0.2.0-rc.2`）。
 
 包内**没有声明 `peerDependencies`，也没有声明 `engines.dsh`**——这是有意的：它不 import 任何 Harness 包（客户端半边只 `require('react')`，宿主半边是一个空的 `apply`），所有宿主交互都做了存在性检查并在缺失时降级或明确报错。声明一个我没法验证的版本范围，只会让安装被挡住。
 
