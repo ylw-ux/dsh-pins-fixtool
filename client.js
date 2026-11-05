@@ -51,7 +51,25 @@ window.__ModuleLoader__.load({
     const TAB_ID = 'dsh-pins';
     const STATE_KEY = 'dsh-pins/v1';
     const MODE_KEY = 'dsh-pins/mode';
-    const MAX_CHARS = 600;
+    /**
+     * How much of one selection is stored, in characters.
+     *
+     * 600 → 2000 (2026-11-05). The old figure was a storage cap, not a reading preference:
+     * the card clamps itself to 2–3 lines and the hover window scrolls, so display never
+     * needed the cap's help. At 2000 a page of prose or a 100-line function survives whole,
+     * and the quota still holds roughly 780 passages — far more than anyone pins. Truncation
+     * itself is unchanged: a longer selection is cut here, the toolbar says so before the
+     * click, and the card keeps its 「已截断」 badge.
+     */
+    const MAX_CHARS = 2000;
+    /**
+     * The cap this plugin shipped before 2000, kept only to read old records.
+     *
+     * Nothing is written with it. It exists so a pin recorded under the 600 cap still shows
+     * 「已截断」: its text is exactly 600 characters and the record carries no flag saying
+     * why. New pins record `anchor.truncated`, so they never need the guess.
+     */
+    const LEGACY_MAX_CHARS = 600;
     const TOOLBAR_HEIGHT = 40;
     const TOOLBAR_WIDTH = 220;
     /** How far from the recorded offset a re-located passage may sit, in characters. */
@@ -215,6 +233,24 @@ window.__ModuleLoader__.load({
     loadStableMsgOrder();
 
     //#endregion
+
+    /**
+     * Whether a pin's stored text was cut at capture time.
+     *
+     * New records carry `anchor.truncated`, so the answer is read rather than guessed.
+     * Records written before that flag existed have to be inferred: they were capped at
+     * LEGACY_MAX_CHARS, so a text of exactly that length was cut (or happened to be exactly
+     * that long, in which case the badge is a harmless white lie). `partial` still counts —
+     * it marks a passage whose boundaries could not be resolved exactly.
+     */
+    function wasTruncated(pin, text) {
+      const anchor = pin?.anchor ?? {};
+      if (anchor.partial === true) return true;
+      if (anchor.truncated === true) return true;
+      if (anchor.truncated === false) return false;
+      const length = typeof text === 'string' ? text.length : 0;
+      return length === LEGACY_MAX_CHARS || length >= MAX_CHARS;
+    }
 
     //#region storage and store
 
@@ -887,6 +923,11 @@ window.__ModuleLoader__.load({
           block: singleBlock,
           lang: singleBlock === 'code' ? codeLanguageOf(startElement) : '',
           partial,
+          // Recorded, not inferred. The card must know whether the stored text is the whole
+          // passage or only its head, and once the cap moves a length comparison can no
+          // longer answer that: a 600-character pin from an older build was cut, a
+          // 600-character pin from this one is complete.
+          truncated,
         },
         text: rawQuote,
         truncated,
@@ -3936,7 +3977,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           h('span', null, sourceLabel(pin)),
           pin.anchor?.turn ? h('span', null, `第 ${pin.anchor.turn} 轮`) : null,
           pin.anchor?.block === 'code' ? h('span', null, `代码${pin.anchor.lang ? ` · ${pin.anchor.lang}` : ''}`) : null,
-          (pin.anchor?.partial === true || fullText.length > 600) ? h('span', { className: 'warn' }, '已截断') : null,
+          wasTruncated(pin, fullText) ? h('span', { className: 'warn' }, '已截断') : null,
           markerReport.get(pin.id) === 'miss'
             ? h('span', { className: 'warn', title: '这条消息在屏幕上，但没能定位到选中的那段文字：点卡片会跳到整条消息' }, '原文未找到')
             : null,
