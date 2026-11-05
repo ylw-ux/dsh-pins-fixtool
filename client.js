@@ -2124,6 +2124,34 @@ window.__ModuleLoader__.load({
 .note-x:hover,.note-x:focus-visible{opacity:1}
 .dsh-pins-note .note-x:focus-visible,.dsh-pins-root .note .note-x:focus-visible{
   outline:none;box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary))}
+/* 设置 → 插件 → 固定片段。This page renders in the settings shell, outside
+   .dsh-pins-root, so it carries its own prefix. Read-only: nothing here writes. */
+.dsh-pins-settings{display:flex;flex-direction:column;gap:10px;max-width:560px;
+  color:var(--dsw-alias-label-primary);font-size:var(--dsw-font-xxs-12-font-size,12px);
+  line-height:var(--dsw-font-xxs-12-line-height,18px)}
+.dsh-pins-settings h3{margin:0;font-size:var(--dsw-font-xs-strong-13-font-size,13px);
+  line-height:var(--dsw-font-xs-strong-13-line-height,20px);font-weight:500}
+.dsh-pins-settings .row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.dsh-pins-settings .k{flex:none;min-width:4em;color:var(--dsw-alias-label-secondary)}
+.dsh-pins-settings .v{font-variant-numeric:tabular-nums}
+.dsh-pins-settings .hint{margin:0;color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-settings .warn{padding:7px 9px;border:1px solid var(--dsw-alias-state-warn-primary);
+  border-radius:var(--dsw-radius-sm);
+  background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 8%,transparent)}
+.dsh-pins-settings button.mini{align-self:flex-start;padding:4px 10px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:0 0;color:var(--dsw-alias-label-primary);font:inherit;
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);cursor:pointer}
+.dsh-pins-settings button.mini:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-settings button.mini:focus-visible{outline:none;
+  box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),
+    0 0 0 4px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary))}
+.dsh-pins-meter{height:6px;border-radius:999px;overflow:hidden;
+  background:var(--dsw-alias-interactive-bg-hover-solid)}
+.dsh-pins-meter > i{display:block;height:100%;border-radius:inherit;
+  background:var(--dsw-alias-state-business-primary)}
+.dsh-pins-meter.is-warn > i{background:var(--dsw-alias-state-warn-primary)}
+.dsh-pins-meter.is-full > i{background:var(--dsw-alias-state-error-primary)}
 .dsh-pins-crash{position:fixed;right:18px;bottom:64px;z-index:30;max-width:280px;padding:8px 12px;
   border:1px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-md);
   background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-state-error-primary);
@@ -5075,6 +5103,157 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#endregion
 
+    //#region settings
+
+    /**
+     * Upper bound used only to turn a character count into a "约 X%" figure.
+     *
+     * It is a **character** budget, not a byte budget: Chrome fills a ~5 MB origin quota
+     * with roughly 5.0–5.2M UTF-16 characters (measured by filling one in 2049-char blocks
+     * until QuotaExceededError). Browsers differ, so every percentage derived from it is
+     * labelled 约 and `navigator.storage.estimate()` is deliberately never mixed in — that
+     * API answers in bytes including per-entry overhead, and using both would double every
+     * number on the page.
+     */
+    const STORAGE_CHARS_LIMIT = 5_000_000;
+
+    /** One walk of this origin's storage, split into "this plugin" and "everything". */
+    function measureStorage() {
+      const blank = {
+        ours: 0,
+        ourKeys: 0,
+        all: 0,
+        keys: 0,
+        pinCount: 0,
+        oursShare: 0,
+        allShare: 0,
+        unavailable: false,
+      };
+      try {
+        if (globalThis.localStorage === undefined) return { ...blank, unavailable: true };
+        let ours = 0;
+        let ourKeys = 0;
+        let all = 0;
+        let keys = 0;
+        for (let i = 0; i < localStorage.length; i += 1) {
+          const key = localStorage.key(i);
+          if (key === null) continue;
+          const value = localStorage.getItem(key) ?? '';
+          const chars = key.length + value.length;
+          all += chars;
+          keys += 1;
+          // `dsh-pins/v1`, `dsh-pins/mode`, and the per-pin text keys of the planned
+          // split-key store all live under the package prefix.
+          if (key === STATE_KEY || key.startsWith(`${PKG}/`)) {
+            ours += chars;
+            ourKeys += 1;
+          }
+        }
+        let pinCount = 0;
+        for (const [, entry] of store.sessions()) pinCount += entry?.pins?.length ?? 0;
+        return {
+          ours,
+          ourKeys,
+          all,
+          keys,
+          pinCount,
+          oursShare: ours / STORAGE_CHARS_LIMIT,
+          allShare: all / STORAGE_CHARS_LIMIT,
+          unavailable: false,
+        };
+      } catch (error) {
+        console.error('[dsh-pins] 统计存储占用失败', error);
+        return { ...blank, unavailable: true };
+      }
+    }
+
+    /** A character count in the units a person can compare: 字符, 约 KB, 约 MB. */
+    function formatChars(chars) {
+      if (chars < 1024) return `${chars} 字符`;
+      const kb = (chars * 2) / 1024;
+      if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB（${chars.toLocaleString()} 字符）`;
+      return `${(kb / 1024).toFixed(1)} MB（${chars.toLocaleString()} 字符）`;
+    }
+
+    /**
+     * 设置 → 插件 → 固定片段：只读的"已用存储"面板。
+     *
+     * Read-only on purpose: the first settings page answers "how much room do I take",
+     * and nothing on it can destroy data. Every number is re-derived from `localStorage`
+     * on mount, on every store change, and on demand, so there is no cached figure that
+     * can quietly drift from reality.
+     */
+    function StorageSettingsTab() {
+      const [reading, setReading] = React.useState(() => measureStorage());
+      React.useEffect(() => store.subscribe(() => setReading(measureStorage())), []);
+      const refresh = React.useCallback(() => setReading(measureStorage()), []);
+      const percent = (share) => `约 ${(share * 100).toFixed(share < 0.1 ? 1 : 0)}%`;
+      const barState = reading.allShare >= 1 ? 'is-full' : reading.allShare >= 0.9 ? 'is-warn' : '';
+
+      return h(
+        'div',
+        { className: 'dsh-pins-settings', 'data-dsh-pins': '' },
+        h('h3', null, '已用存储'),
+        reading.unavailable
+          ? h(
+              'div',
+              { className: 'warn' },
+              '这个页面不允许访问本地存储：占用无法统计，片段也不会被保存。',
+            )
+          : null,
+        h(
+          'div',
+          { className: 'row' },
+          h('span', { className: 'k' }, '本插件'),
+          h(
+            'span',
+            { className: 'v' },
+            `${reading.pinCount} 条片段 · ${formatChars(reading.ours)} · ${percent(reading.oursShare)}`,
+          ),
+        ),
+        h(
+          'div',
+          { className: 'row' },
+          h('span', { className: 'k' }, '本站总计'),
+          h(
+            'span',
+            { className: 'v' },
+            `${reading.keys} 个键 · ${formatChars(reading.all)} · ${percent(reading.allShare)}`,
+          ),
+        ),
+        h(
+          'div',
+          { className: `dsh-pins-meter ${barState}`.trim(), role: 'img', 'aria-label': `本站存储已用 ${percent(reading.allShare)}` },
+          h('i', { style: { width: `${Math.min(100, reading.allShare * 100).toFixed(1)}%` } }),
+        ),
+        reading.allShare >= 0.9
+          ? h(
+              'div',
+              { className: 'warn', role: 'status' },
+              reading.allShare >= 1
+                ? '本站存储已满：新的固定不会保存。删掉一些片段，或清理这个站点的数据后重试。'
+                : '本站存储已用约 90% 以上：再存内容可能失败，建议先清理。',
+            )
+          : null,
+        h('div', { className: 'row' }, h('button', { type: 'button', className: 'mini', onClick: refresh }, '重新统计')),
+        h(
+          'p',
+          { className: 'hint' },
+          '片段存在这个站点的浏览器存储里，不上传、不同步；清除「Cookie 及其他网站数据」会一并清掉，换端口或域名访问也看不到同一份。',
+        ),
+        h(
+          'p',
+          { className: 'hint' },
+          `百分比按本站存储的字符数 ÷ 约 ${(STORAGE_CHARS_LIMIT / 10000).toFixed(0)} 万估算，不同浏览器的上限不同，所以标「约」。`,
+        ),
+        reading.ourKeys > 0
+          ? h('p', { className: 'hint' }, `本插件目前占用 ${reading.ourKeys} 个存储键。`)
+          : null,
+      );
+    }
+
+    //#endregion
+
     //#region registration
 
     /**
@@ -5287,6 +5466,27 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           );
         } catch (error) {
           console.error('[dsh-pins] 左栏入口注册失败', error);
+        }
+      }
+
+      // 设置 → 插件 → 固定片段：只读的占用统计。
+      //
+      // `settings.plugins.tab` is declared by the Plugins settings **section**, so it exists
+      // only while that section is mounted — hence `slots.inject`, like every other
+      // contribution here. If the settings plugin package is disabled the tab simply is not
+      // offered; nothing else in the plugin depends on it.
+      if (slots && typeof slots.inject === 'function' && typeof slots.register === 'function') {
+        try {
+          own(
+            slots.inject('settings.plugins.tab', () =>
+              slots.register(
+                { name: 'settings.plugins.tab', id: PKG, order: 40, label: '固定片段' },
+                () => h(StorageSettingsTab),
+              ),
+            ),
+          );
+        } catch (error) {
+          console.error('[dsh-pins] 设置页注册失败', error);
         }
       }
 
