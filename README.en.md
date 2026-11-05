@@ -64,7 +64,7 @@ Quoting comes in two shapes, and **both carry their content — neither is a poi
 
 - **Web only** (`platform: web`). TUI and Desktop have no such surface.
 - **Anchors depend on the host's DOM contract** (`data-chat-flow-key`, `data-chat-turn`, `[data-conversation-scroll]`). If the host renames them all at once, durable marks and precise jumps break together — **your data does not** (it is still text, turn and offset), and jumping degrades to a position-based fallback. This is the one risk the plugin cannot verify for itself, so it is written down here.
-- **A selection longer than 2000 characters is kept as its first 2000** (the toolbar and the success notice say so at capture time). Quotes and chips share that ceiling. Passages saved before 1.0.4 hold only their first 600 characters, and that part cannot be recovered.
+- **A selection longer than 2000 characters is kept as its first 2000** (the toolbar and the success notice say so at capture time, and the card marks it 「已截断」). Quotes and chips share that ceiling. Passages saved before 1.0.4 hold only their first 600 characters, and that part cannot be recovered.
 - **When the same text appears several times in one message**, the jump picks the occurrence nearest the recorded offset that also passes a text check; if none does, it falls back to the whole message and marks the card 「原文未找到」.
 
 ## Compatibility

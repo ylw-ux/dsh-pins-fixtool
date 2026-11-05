@@ -64,6 +64,15 @@ window.__ModuleLoader__.load({
      * paragraph"), which is true for nearly every pin.
      */
     const MAX_CHARS = 2000;
+    /**
+     * The cap this plugin shipped before 2000, used only to read old records.
+     *
+     * Never written. Records made under it were cut at exactly this length, so a text of
+     * exactly 600 characters in an old record is treated as truncated — the least wrong
+     * inference available, since those records carry no flag and nothing else can tell.
+     * A record written by this version always answers from `anchor.truncated` instead.
+     */
+    const LEGACY_MAX_CHARS = 600;
     const TOOLBAR_HEIGHT = 40;
     const TOOLBAR_WIDTH = 220;
     /** How far from the recorded offset a re-located passage may sit, in characters. */
@@ -227,6 +236,25 @@ window.__ModuleLoader__.load({
     loadStableMsgOrder();
 
     //#endregion
+
+    /**
+     * Whether the card should say that a pin's stored text was cut.
+     *
+     * New records answer exactly: `anchor.truncated === true` is written only when the
+     * selection really was cut, and its absence means the whole selection is stored.
+     * Records made before that flag existed cannot answer, so exactly-at-the-old-cap is
+     * treated as cut — that is what the 600 cap did to them.
+     *
+     * `partial` is deliberately **not** consulted. It means "the selection is only a
+     * fragment of its paragraph", which is true for nearly every pin that is not a whole
+     * paragraph, and using it here is what put 「已截断」 on ordinary passages.
+     */
+    function truncatedMark(pin, text) {
+      const anchor = pin?.anchor ?? {};
+      if (anchor.truncated === true) return true;
+      if (anchor.truncated === false) return false;
+      return (typeof text === 'string' ? text.length : 0) === LEGACY_MAX_CHARS;
+    }
 
     //#region storage and store
 
@@ -899,6 +927,9 @@ window.__ModuleLoader__.load({
           block: singleBlock,
           lang: singleBlock === 'code' ? codeLanguageOf(startElement) : '',
           partial,
+          // Written only when it happened: absence is a fact too ("the whole selection is
+          // stored"), and it keeps ordinary records from carrying a field that says nothing.
+          ...(truncated ? { truncated: true } : {}),
         },
         text: rawQuote,
         truncated,
@@ -3956,6 +3987,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           h('span', null, sourceLabel(pin)),
           pin.anchor?.turn ? h('span', null, `第 ${pin.anchor.turn} 轮`) : null,
           pin.anchor?.block === 'code' ? h('span', null, `代码${pin.anchor.lang ? ` · ${pin.anchor.lang}` : ''}`) : null,
+          truncatedMark(pin, fullText)
+            ? h(
+                'span',
+                { className: 'warn', title: `这段文字超过单条上限，只保存了前 ${MAX_CHARS} 字` },
+                '已截断',
+              )
+            : null,
           markerReport.get(pin.id) === 'miss'
             ? h('span', { className: 'warn', title: '这条消息在屏幕上，但没能定位到选中的那段文字：点卡片会跳到整条消息' }, '原文未找到')
             : null,
