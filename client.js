@@ -18,6 +18,24 @@
  * Failures are reported, never silent: a selection outside a message node, a
  * selection spanning two messages, and a missing Host/Sidebar service each
  * surface as console errors or an in-panel notice instead of a wrong pin.
+ *
+ * Region map — the `//#region` markers below, in file order. Names only, on
+ * purpose: line numbers drift with every edit and a stale number misleads more
+ * than no number at all. Search for the marker name.
+ *
+ *   constants                        plugin ids, storage keys, size limits, host selectors
+ *   storage and store                the persisted shape, dedupe, write-failure status
+ *   selection reading                DOM selection -> anchor (quote, raw quote, offsets, turn)
+ *   jumping back                     locate a pin's passage in a message and scroll/flash it
+ *   persistent pin markers           CSS.highlights / <mark> painting over the transcript
+ *   styles                           the whole stylesheet, injected once (no backticks inside)
+ *   floating action bar              the selection toolbar, its actions and its notices
+ *   tags                             the tag manager (panel side) and its row model
+ *   export                           the markdown outline builder, download and clipboard fallback
+ *   quoting into the composer        build a quote block and hand it to the composer
+ *   reference chips in the composer  the `@固定片段` trigger source and the chip payload codec
+ *   sidebar panel                    the right-tab body: views, filters, sorting, cards
+ *   registration                     slot/tab/service wiring and teardown
  */
 
 window.__ModuleLoader__.load({
@@ -33,7 +51,28 @@ window.__ModuleLoader__.load({
     const TAB_ID = 'dsh-pins';
     const STATE_KEY = 'dsh-pins/v1';
     const MODE_KEY = 'dsh-pins/mode';
-    const MAX_CHARS = 600;
+    /**
+     * How much of one selection is stored, in characters.
+     *
+     * 600 → 2000 (2026-11-05). The old figure was a storage cap, not a reading preference:
+     * the card clamps itself to 2–3 lines and the hover window scrolls, so display never
+     * needed the cap's help. At 2000 a page of prose or a 100-line function survives whole,
+     * and the quota still holds roughly 780 passages — far more than anyone pins. Truncation
+     * itself is unchanged: a longer selection is cut here, the toolbar says so before the
+     * click, and the success notice repeats it afterwards. Nothing is marked on the card —
+     * a standing badge could not distinguish "cut" from `partial` ("a fragment of its
+     * paragraph"), which is true for nearly every pin.
+     */
+    const MAX_CHARS = 2000;
+    /**
+     * The cap this plugin shipped before 2000, used only to read old records.
+     *
+     * Never written. Records made under it were cut at exactly this length, so a text of
+     * exactly 600 characters in an old record is treated as truncated — the least wrong
+     * inference available, since those records carry no flag and nothing else can tell.
+     * A record written by this version always answers from `anchor.truncated` instead.
+     */
+    const LEGACY_MAX_CHARS = 600;
     const TOOLBAR_HEIGHT = 40;
     const TOOLBAR_WIDTH = 220;
     /** How far from the recorded offset a re-located passage may sit, in characters. */
@@ -197,6 +236,25 @@ window.__ModuleLoader__.load({
     loadStableMsgOrder();
 
     //#endregion
+
+    /**
+     * Whether the card should say that a pin's stored text was cut.
+     *
+     * New records answer exactly: `anchor.truncated === true` is written only when the
+     * selection really was cut, and its absence means the whole selection is stored.
+     * Records made before that flag existed cannot answer, so exactly-at-the-old-cap is
+     * treated as cut — that is what the 600 cap did to them.
+     *
+     * `partial` is deliberately **not** consulted. It means "the selection is only a
+     * fragment of its paragraph", which is true for nearly every pin that is not a whole
+     * paragraph, and using it here is what put 「已截断」 on ordinary passages.
+     */
+    function truncatedMark(pin, text) {
+      const anchor = pin?.anchor ?? {};
+      if (anchor.truncated === true) return true;
+      if (anchor.truncated === false) return false;
+      return (typeof text === 'string' ? text.length : 0) === LEGACY_MAX_CHARS;
+    }
 
     //#region storage and store
 
@@ -869,6 +927,9 @@ window.__ModuleLoader__.load({
           block: singleBlock,
           lang: singleBlock === 'code' ? codeLanguageOf(startElement) : '',
           partial,
+          // Written only when it happened: absence is a fact too ("the whole selection is
+          // stored"), and it keeps ordinary records from carrying a field that says nothing.
+          ...(truncated ? { truncated: true } : {}),
         },
         text: rawQuote,
         truncated,
@@ -1174,7 +1235,9 @@ window.__ModuleLoader__.load({
      *      against.
      *
      * `widen` grows a short quote to the surrounding word boundaries so a two-word
-     * pin is still findable by eye; the widening is re-verified so it can never
+     * pin is still findable by eye. Only ASCII word fragments are absorbed: widening
+     * across a space is a word-boundary rule, and in Chinese the nearest space is
+     * layout, not a word edge (S15). The widening is re-verified so it can never
      * drift onto neighbouring words.
      *
      * @returns `{ range, verdict }` — `'exact'` for a quote match, `'message'` when
@@ -1236,13 +1299,26 @@ window.__ModuleLoader__.load({
         let length = best.length;
         if (widen && length < 24) {
           const text = view ?? index.raw;
+          // Word-widening assumes a space is a word boundary. That holds for English and
+          // fails for Chinese, where the nearest space is usually layout — after "5.5 ",
+          // after a dash, or between a CJK run and an ASCII word — rather than a word edge.
+          // Pinning 「前面各节」 inside "5.5 与前面各节的关系。" therefore marked
+          // 「与前面各节」: one character stolen from the neighbouring word. Only absorb
+          // ASCII word characters, so `exam` still grows to `example` while a CJK selection
+          // keeps exactly the characters the user picked. The pass below still re-verifies
+          // the resolved range, so a wrong widening degrades to a message mark, never a
+          // misplaced one.
+          const wordChar = /[A-Za-z0-9_'’-]/;
+          const absorbedWords = (slice) => slice !== '' && [...slice].every((ch) => wordChar.test(ch));
           const left = text.lastIndexOf(' ', start);
-          if (left >= 0 && start - left < 8) {
+          if (left >= 0 && start - left < 8 && absorbedWords(text.slice(left + 1, start))) {
             length += start - left - 1;
             start = left + 1;
           }
           const right = text.indexOf(' ', start + length);
-          if (right >= 0 && right - (start + length) < 8) length = right - start;
+          if (right >= 0 && right - (start + length) < 8 && absorbedWords(text.slice(start + length, right))) {
+            length = right - start;
+          }
         }
 
         const range = best.mode === 'raw'
@@ -2078,6 +2154,47 @@ window.__ModuleLoader__.load({
 @keyframes dsh-pins-note-in{
   from{opacity:0;transform:translate(-50%, 4px)}
   to{opacity:1;transform:translate(-50%, 0)}}
+/* An error notice may not retire on a timer, so it needs a way to be dismissed by hand.
+   The row turns into a flex line only in the error case, leaving confirmations as the
+   single centred line they have always been. */
+.dsh-pins-note.is-error{display:flex;align-items:center;gap:8px;pointer-events:auto;
+  border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+.dsh-pins-root .note.is-error{display:flex;align-items:center;gap:6px;
+  color:var(--dsw-alias-state-error-primary)}
+.dsh-pins-note .note-text,.dsh-pins-root .note .note-text{min-width:0}
+.note-x{flex:none;padding:0 3px;border:0;background:none;color:inherit;font:inherit;
+  line-height:1;cursor:pointer;opacity:.7}
+.note-x:hover,.note-x:focus-visible{opacity:1}
+.dsh-pins-note .note-x:focus-visible,.dsh-pins-root .note .note-x:focus-visible{
+  outline:none;box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary))}
+/* 设置 → 插件 → 固定片段。This page renders in the settings shell, outside
+   .dsh-pins-root, so it carries its own prefix. Read-only: nothing here writes. */
+.dsh-pins-settings{display:flex;flex-direction:column;gap:10px;max-width:560px;
+  color:var(--dsw-alias-label-primary);font-size:var(--dsw-font-xxs-12-font-size,12px);
+  line-height:var(--dsw-font-xxs-12-line-height,18px)}
+.dsh-pins-settings h3{margin:0;font-size:var(--dsw-font-xs-strong-13-font-size,13px);
+  line-height:var(--dsw-font-xs-strong-13-line-height,20px);font-weight:500}
+.dsh-pins-settings .row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.dsh-pins-settings .k{flex:none;min-width:4em;color:var(--dsw-alias-label-secondary)}
+.dsh-pins-settings .v{font-variant-numeric:tabular-nums}
+.dsh-pins-settings .hint{margin:0;color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-settings .warn{padding:7px 9px;border:1px solid var(--dsw-alias-state-warn-primary);
+  border-radius:var(--dsw-radius-sm);
+  background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 8%,transparent)}
+.dsh-pins-settings button.mini{align-self:flex-start;padding:4px 10px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:0 0;color:var(--dsw-alias-label-primary);font:inherit;
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);cursor:pointer}
+.dsh-pins-settings button.mini:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-settings button.mini:focus-visible{outline:none;
+  box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),
+    0 0 0 4px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary))}
+.dsh-pins-meter{height:6px;border-radius:999px;overflow:hidden;
+  background:var(--dsw-alias-interactive-bg-hover-solid)}
+.dsh-pins-meter > i{display:block;height:100%;border-radius:inherit;
+  background:var(--dsw-alias-state-business-primary)}
+.dsh-pins-meter.is-warn > i{background:var(--dsw-alias-state-warn-primary)}
+.dsh-pins-meter.is-full > i{background:var(--dsw-alias-state-error-primary)}
 .dsh-pins-crash{position:fixed;right:18px;bottom:64px;z-index:30;max-width:280px;padding:8px 12px;
   border:1px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-md);
   background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-state-error-primary);
@@ -2355,6 +2472,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     function FloatingActions({ context }) {
       const [state, setState] = React.useState(null);
       const [notice, setNotice] = React.useState('');
+      const [noticeIsError, setNoticeIsError] = React.useState(false);
       const stateRef = React.useRef(null);
       const actionRef = React.useRef(() => {});
       stateRef.current = state;
@@ -2411,9 +2529,17 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // A pin changed: redraw the marks, without pretending the DOM moved.
       React.useEffect(() => store.subscribe(() => scheduleMarkers(false)), []);
 
-      const say = React.useCallback((text) => {
+      // Two kinds of message share this one surface. An `info` notice is a confirmation
+      // and may leave on a timer; an `error` notice is the only account of something that
+      // failed, so it stays until another notice replaces it or the user closes it — a
+      // failure that leaves before it is read is the same as one never shown.
+      const noticeTimer = React.useRef(0);
+      const say = React.useCallback((text, kind = 'info') => {
+        // A pending confirmation timer must not cut a new error short.
+        window.clearTimeout(noticeTimer.current);
         setNotice(text);
-        window.setTimeout(() => setNotice(''), 3200);
+        setNoticeIsError(kind === 'error');
+        if (kind !== 'error') noticeTimer.current = window.setTimeout(() => setNotice(''), 3200);
       }, []);
       sayRef.current = say;
 
@@ -2422,7 +2548,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       React.useEffect(() => {
         const onNotice = (event) => {
           if (event.detail?.surface !== 'floating') return;
-          sayRef.current(String(event.detail?.text ?? ''));
+          sayRef.current(
+            String(event.detail?.text ?? ''),
+            event.detail?.kind === 'error' ? 'error' : 'info',
+          );
         };
         PINS_EVENTS.addEventListener('notice', onNotice);
         return () => PINS_EVENTS.removeEventListener('notice', onNotice);
@@ -2521,7 +2650,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
           const target = liveSession();
           if (!target) {
-            say('这个对话还没进入会话上下文，暂时无法固定');
+            say('这个对话还没进入会话上下文，暂时无法固定', 'error');
             return;
           }
 
@@ -2541,7 +2670,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               else if (outcome.ok) say(`${pinned}把引用放进输入框`);
               // Nothing claims a clipboard copy here: this path never writes one, and saying
               // so left the user with an empty clipboard and a notice that insisted otherwise.
-              else say(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
+              else say(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`, 'error');
             });
             return;
           }
@@ -2579,7 +2708,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               }
             } catch (error) {
               console.error('[dsh-pins] 保存固定失败', error);
-              say(`保存失败：${String(error?.message ?? error)}`);
+              say(`保存失败：${String(error?.message ?? error)}`, 'error');
               return;
             }
             dismissBar(action.type === 'tag' ? '固定并打标签之后' : '固定之后');
@@ -2590,12 +2719,25 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             }
             if (store.lastPersisted === false) {
               const status = store.storageStatus();
-              say(status.error || '保存失败：这条没有写入本地存储');
+              say(status.error || '保存失败：这条没有写入本地存储', 'error');
               return;
             }
             const count = store.count(target);
             const panelProblem = showPanel();
-            say(panelProblem !== '' ? `已固定 ${count} 条 · ${panelProblem}` : `已固定 ${count} 条（原文已加标记）`);
+            // Truncation is reported here, at the moment it happens, rather than as a
+            // standing badge on the card. A badge cannot tell "this text was cut" from
+            // "this text is a fragment of its paragraph" — that is what `partial` means,
+            // and it is true for nearly every passage that is not a whole paragraph — so
+            // the badge fired on ordinary pins. The moment of capture is also the only
+            // moment the number is useful: it is when the user decides whether to keep it.
+            const cut = current.truncated === true ? `，超过 ${MAX_CHARS} 字只存了前 ${MAX_CHARS} 字` : '';
+            say(
+              panelProblem !== ''
+                ? `已固定 ${count} 条${cut} · ${panelProblem}`
+                : `已固定 ${count} 条（原文已加标记）${cut}`,
+              // the pin itself landed; only the panel failed to open
+              panelProblem !== '' ? 'error' : 'info',
+            );
           }
         },
         [liveSession, say, showPanel, dismissBar],
@@ -2689,7 +2831,28 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         state ? h(Toolbar, { state, onAction }) : null,
         h(ReturnPill, { context }),
         notice !== ''
-          ? h('div', { className: 'dsh-pins-note', role: 'status', 'aria-live': 'polite' }, notice)
+          ? h(
+              'div',
+              {
+                // an error interrupts a screen reader; a confirmation waits its turn
+                className: noticeIsError ? 'dsh-pins-note is-error' : 'dsh-pins-note',
+                role: noticeIsError ? 'alert' : 'status',
+                'aria-live': noticeIsError ? 'assertive' : 'polite',
+              },
+              h('span', { className: 'note-text' }, notice),
+              noticeIsError
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'note-x',
+                      'aria-label': '关闭提示',
+                      onClick: () => setNotice(''),
+                    },
+                    '✕',
+                  )
+                : null,
+            )
           : null,
       );
     }
@@ -2781,8 +2944,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       return clampPanelManagerHeight(value);
     }
 
-    function announce(text) {
-      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'panel' } }));
+    /**
+     * Report something inside the panel.
+     *
+     * `kind: 'error'` marks a message the user must not miss: the panel keeps it until the
+     * next notice replaces it instead of retiring it on a timer.
+     */
+    function announce(text, kind = 'info') {
+      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'panel', kind } }));
     }
 
     /**
@@ -2792,8 +2961,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * a notice about the bar that only lands there is a notice the user never sees.
      * Anything a click in the bar produces therefore goes to the floating surface.
      */
-    function announceHere(text) {
-      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'floating' } }));
+    function announceHere(text, kind = 'info') {
+      PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'floating', kind } }));
     }
 
     /**
@@ -3114,10 +3283,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      */
     async function requestQuote(anchor, text, origin, alsoPin, tag, wake) {
       const wanted = anchor?.sessionId ?? '';
+      // One id for the whole gesture. An attempt can time out *after* a panel has already
+      // inserted — the answer only arrives late — so the retry has to be recognisable as the
+      // same request, or the passage is pasted twice.
+      const requestId = `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       // No wake-up on the first attempt: a panel that is already mounted answers in the
       // same tick, and opening a sidebar the user did not ask for would be a visible change
       // for no reason.
-      const first = await attemptQuote(anchor, text, origin, alsoPin, tag, 400);
+      const first = await attemptQuote(anchor, text, origin, alsoPin, tag, 400, requestId, wanted);
       // `session-mismatch` means a panel is mounted but sitting on another conversation. It
       // must not insert there (the editor is not on screen and the pin would be filed under
       // the wrong conversation), and opening the tab is exactly what lets a kept-mounted
@@ -3128,14 +3301,23 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // React needs a frame or two after `openTab` before the panel's listener exists, so
       // ping until it answers rather than sleeping for a guessed duration.
       await waitForPanel(1500, wanted);
-      return attemptQuote(anchor, text, origin, alsoPin, tag, 1500);
+      return attemptQuote(anchor, text, origin, alsoPin, tag, 1500, requestId, wanted);
     }
 
-    /** One `quote-req` round trip. Resolves `{ reason: 'no-panel' }` when nobody answers. */
-    function attemptQuote(anchor, text, origin, alsoPin, tag, timeoutMs) {
+    /**
+     * One `quote-req` round trip.
+     *
+     * Resolves `{ reason: 'no-panel' }` when nobody answers. A refusal from a panel that is
+     * showing another Session does **not** settle the attempt: several panels can be mounted
+     * at once (a kept-mounted tab per Session), and letting the stale one win the race is how
+     * a quote that was in fact inserted still reported 「还停在另一个会话上」. The refusal is
+     * remembered so the final message can still explain that case.
+     */
+    function attemptQuote(anchor, text, origin, alsoPin, tag, timeoutMs, requestId, wanted) {
       return new Promise((resolve) => {
         const token = `q-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
         let settled = false;
+        let refusal = null;
         const finish = (outcome) => {
           if (settled) return;
           settled = true;
@@ -3144,14 +3326,23 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           resolve(outcome);
         };
         const onDone = (event) => {
-          if (event.detail?.token !== token) return;
-          finish(event.detail);
+          const detail = event.detail ?? {};
+          if (detail.token !== token) return;
+          const from = typeof detail.sessionId === 'string' ? detail.sessionId : '';
+          if (from !== '' && wanted !== '' && from !== wanted) {
+            refusal = detail;
+            return;
+          }
+          finish(detail);
         };
-        const timer = window.setTimeout(() => finish({ ok: false, reason: 'no-panel' }), timeoutMs);
+        const timer = window.setTimeout(
+          () => finish(refusal ?? { ok: false, reason: 'no-panel' }),
+          timeoutMs,
+        );
         PINS_EVENTS.addEventListener('quote-done', onDone);
         PINS_EVENTS.dispatchEvent(
           new CustomEvent('quote-req', {
-            detail: { token, sessionId: anchor?.sessionId ?? '', anchor, text, origin, alsoPin: alsoPin === true, tag },
+            detail: { token, requestId, sessionId: wanted, anchor, text, origin, alsoPin: alsoPin === true, tag },
           }),
         );
       });
@@ -3506,6 +3697,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                 : elsewhere > 0
                   ? `这个对话还没有固定片段；你在别的对话里固定过 ${elsewhere} 条，右栏切到「全部」就能看到。`
                   : '这个对话还没有固定过内容：划选一段文字，点浮条上的「固定」就会出现在这里。',
+                // the two empty states are explanations; the first line is a failure
+                problem !== '' ? 'error' : 'info',
             );
             return undefined;
           }
@@ -3516,7 +3709,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           const sessionId = sessionIdOf(pick?.session);
           const pin = sessionId === '' ? undefined : store.get(sessionId, value);
           if (!pin) {
-            announce('这条固定片段已经不在列表里了');
+            announce('这条固定片段已经不在列表里了', 'error');
             return undefined;
           }
           const text = chipText(pin, deps.titleOf(sessionId));
@@ -3565,7 +3758,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           if (!parsed) return false;
           const problem = deps.openPanel();
           if (problem !== '') {
-            announceHere(`打不开固定片段面板：${problem}`);
+            announceHere(`打不开固定片段面板：${problem}`, 'error');
             return true;
           }
           const sessionId = sessionIdOf(session);
@@ -3628,7 +3821,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // Typing only `#` normalized to nothing; say so instead of clearing the box
           // and appearing to have accepted it. This happens in the panel, so the panel
           // is where it belongs.
-          if (typed) announce('标签名不能只有 # 或空格');
+          if (typed) announce('标签名不能只有 # 或空格', 'error');
           return;
         }
         const added = onTagChange('add', tag);
@@ -3641,7 +3834,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         // DOM at all. "Scroll up to load history" would be advice that cannot work there,
         // and switching the conversation is the one thing this panel promised not to do.
         if (foreign) {
-          announce('这条固定片段属于另一个对话，在这里点它不会切换对话；想跳回原文请先切到那个对话。');
+          announce('这条固定片段属于另一个对话，在这里点它不会切换对话；想跳回原文请先切到那个对话。', 'error');
           return;
         }
         let verdict = 'missing';
@@ -3654,7 +3847,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // Through `announce`, not as a bare string in the event detail: the panel reads
           // `detail.text`, so the string form produced an **empty** notice — the click did
           // nothing and said nothing, which is the one outcome this path must not have.
-          announce('这条消息还没加载进当前窗口：先向上滚动加载历史，再点一次。');
+          announce('这条消息还没加载进当前窗口：先向上滚动加载历史，再点一次。', 'error');
           return;
         }
         PINS_EVENTS.dispatchEvent(new Event('jump'));
@@ -3774,7 +3967,6 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           'data-pin-id': pin.id,
           'data-kind': pin.anchor?.kind ?? '',
           'data-block': pin.anchor?.block ?? 'prose',
-          'data-truncated': pin.anchor?.partial === true || fullText.length > 600 ? '' : undefined,
           'data-lines': cardLines(fullText),
           'data-current': current ? '' : undefined,
           'data-open': open ? '' : undefined,
@@ -3795,7 +3987,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           h('span', null, sourceLabel(pin)),
           pin.anchor?.turn ? h('span', null, `第 ${pin.anchor.turn} 轮`) : null,
           pin.anchor?.block === 'code' ? h('span', null, `代码${pin.anchor.lang ? ` · ${pin.anchor.lang}` : ''}`) : null,
-          (pin.anchor?.partial === true || fullText.length > 600) ? h('span', { className: 'warn' }, '已截断') : null,
+          truncatedMark(pin, fullText)
+            ? h(
+                'span',
+                { className: 'warn', title: `这段文字超过单条上限，只保存了前 ${MAX_CHARS} 字` },
+                '已截断',
+              )
+            : null,
           markerReport.get(pin.id) === 'miss'
             ? h('span', { className: 'warn', title: '这条消息在屏幕上，但没能定位到选中的那段文字：点卡片会跳到整条消息' }, '原文未找到')
             : null,
@@ -3956,6 +4154,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         [updateFilter],
       );
       const [notice, setNotice] = React.useState('');
+      const [noticeIsError, setNoticeIsError] = React.useState(false);
+      const noticeTimer = React.useRef(0);
+      /** Answers already produced for one gesture; a retried request must not paste twice. */
+      const handledRequests = React.useRef(new Map());
       const [sort, setSort] = React.useState(() => store.getSort());
       /** Session groups the user folded shut, and the one a search result just revealed. */
       const [collapsed, setCollapsed] = React.useState(() => new Set());
@@ -4088,8 +4290,24 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           PINS_EVENTS.dispatchEvent(new CustomEvent('panel-ready', { detail: { sessionId } }));
         const onRequest = async (event) => {
           const detail = event.detail ?? {};
+          const requestId = typeof detail.requestId === 'string' ? detail.requestId : '';
+          // Every answer says which Session produced it, so the bar can ignore a refusal
+          // from a panel that is merely still mounted for another conversation.
+          const reply = (payload) => {
+            PINS_EVENTS.dispatchEvent(
+              new CustomEvent('quote-done', {
+                detail: { token: detail.token, requestId, sessionId, ...payload },
+              }),
+            );
+          };
           const answer = (payload) => {
-            PINS_EVENTS.dispatchEvent(new CustomEvent('quote-done', { detail: { token: detail.token, ...payload } }));
+            if (requestId !== '') {
+              handledRequests.current.set(requestId, payload);
+              if (handledRequests.current.size > 20) {
+                handledRequests.current.delete(handledRequests.current.keys().next().value);
+              }
+            }
+            reply(payload);
           };
           // This panel can only act on its own Session: `insertIntoComposer` writes into this
           // panel's editor and `store.add` files the pin under this panel's id. A kept-mounted
@@ -4098,11 +4316,19 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // other conversation's title. Refuse, so the bar waits for a panel that matches.
           const wanted = typeof detail.sessionId === 'string' ? detail.sessionId : '';
           if (wanted !== '' && wanted !== sessionId) {
-            answer({
+            // Deliberately `reply`, not `answer`: a refusal is not a handled request, so it
+            // is neither replayed nor remembered — the retry must still reach the right panel.
+            reply({
               ok: false,
               reason: 'session-mismatch',
               message: '右侧栏还停在另一个会话上（切回该会话，或关掉再打开「固定片段」）',
             });
+            return;
+          }
+          // The same gesture arrives twice when the bar retries a slow answer. Replaying the
+          // recorded outcome keeps that retry from inserting a second copy of the passage.
+          if (requestId !== '' && handledRequests.current.has(requestId)) {
+            reply(handledRequests.current.get(requestId));
             return;
           }
           try {
@@ -4179,7 +4405,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           if (!node) {
             // Found by identity, not by luck: say why it is not on screen instead of
             // scrolling somewhere else and calling it a jump.
-            announce('这条固定片段不在当前列表里（可能被搜索、标签筛选或折叠挡住了）');
+            announce('这条固定片段不在当前列表里（可能被搜索、标签筛选或折叠挡住了）', 'error');
             return;
           }
           let scroller = node.parentElement;
@@ -4272,7 +4498,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           ).then((outcome) => {
             if (outcome.viaClipboard) announce('没有可用的输入框，已把引用复制到剪贴板');
             else if (outcome.ok) announce('已把引用放进输入框');
-            else announce(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`);
+            else announce(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`, 'error');
           });
         },
         [context, sessionId],
@@ -4361,8 +4587,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           // at all. Tolerating both shapes means that class of mistake can only ever be
           // wordy, never silent.
           const detail = event.detail;
+          // Timed confirmations and untimed errors share the surface: an error here is
+          // the only account of a click that did nothing, so it waits for the user.
+          window.clearTimeout(noticeTimer.current);
           setNotice(typeof detail === 'string' ? detail : String(detail?.text ?? ''));
-          window.setTimeout(() => setNotice(''), 3600);
+          const isError = typeof detail === 'object' && detail !== null && detail.kind === 'error';
+          setNoticeIsError(isError);
+          if (!isError) noticeTimer.current = window.setTimeout(() => setNotice(''), 3600);
         };
         PINS_EVENTS.addEventListener('filter', onFilter);
         PINS_EVENTS.addEventListener('notice', onNotice);
@@ -4690,7 +4921,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                   list: (id) => store.list(id),
                   titleOf: (id) => readSessionTitle(context, id),
                 });
-                announce(outcome.message);
+                announce(outcome.message, outcome.ok ? 'info' : 'error');
               },
             },
             h('span', { className: 'tool-icon' }, '⤓'),
@@ -4758,7 +4989,27 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             })
           : null,
         notice !== ''
-          ? h('div', { className: 'note', role: 'status', 'aria-live': 'polite' }, notice)
+          ? h(
+              'div',
+              {
+                className: noticeIsError ? 'note is-error' : 'note',
+                role: noticeIsError ? 'alert' : 'status',
+                'aria-live': noticeIsError ? 'assertive' : 'polite',
+              },
+              h('span', { className: 'note-text' }, notice),
+              noticeIsError
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'note-x',
+                      'aria-label': '关闭提示',
+                      onClick: () => setNotice(''),
+                    },
+                    '✕',
+                  )
+                : null,
+            )
           : null,
       );
 
@@ -4905,6 +5156,157 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
       return h('div', { 'data-dsh-pins': '', className: 'dsh-pins-root' }, header, body);
       };
+    }
+
+    //#endregion
+
+    //#region settings
+
+    /**
+     * Upper bound used only to turn a character count into a "约 X%" figure.
+     *
+     * It is a **character** budget, not a byte budget: Chrome fills a ~5 MB origin quota
+     * with roughly 5.0–5.2M UTF-16 characters (measured by filling one in 2049-char blocks
+     * until QuotaExceededError). Browsers differ, so every percentage derived from it is
+     * labelled 约 and `navigator.storage.estimate()` is deliberately never mixed in — that
+     * API answers in bytes including per-entry overhead, and using both would double every
+     * number on the page.
+     */
+    const STORAGE_CHARS_LIMIT = 5_000_000;
+
+    /** One walk of this origin's storage, split into "this plugin" and "everything". */
+    function measureStorage() {
+      const blank = {
+        ours: 0,
+        ourKeys: 0,
+        all: 0,
+        keys: 0,
+        pinCount: 0,
+        oursShare: 0,
+        allShare: 0,
+        unavailable: false,
+      };
+      try {
+        if (globalThis.localStorage === undefined) return { ...blank, unavailable: true };
+        let ours = 0;
+        let ourKeys = 0;
+        let all = 0;
+        let keys = 0;
+        for (let i = 0; i < localStorage.length; i += 1) {
+          const key = localStorage.key(i);
+          if (key === null) continue;
+          const value = localStorage.getItem(key) ?? '';
+          const chars = key.length + value.length;
+          all += chars;
+          keys += 1;
+          // `dsh-pins/v1`, `dsh-pins/mode`, and the per-pin text keys of the planned
+          // split-key store all live under the package prefix.
+          if (key === STATE_KEY || key.startsWith(`${PKG}/`)) {
+            ours += chars;
+            ourKeys += 1;
+          }
+        }
+        let pinCount = 0;
+        for (const [, entry] of store.sessions()) pinCount += entry?.pins?.length ?? 0;
+        return {
+          ours,
+          ourKeys,
+          all,
+          keys,
+          pinCount,
+          oursShare: ours / STORAGE_CHARS_LIMIT,
+          allShare: all / STORAGE_CHARS_LIMIT,
+          unavailable: false,
+        };
+      } catch (error) {
+        console.error('[dsh-pins] 统计存储占用失败', error);
+        return { ...blank, unavailable: true };
+      }
+    }
+
+    /** A character count in the units a person can compare: 字符, 约 KB, 约 MB. */
+    function formatChars(chars) {
+      if (chars < 1024) return `${chars} 字符`;
+      const kb = (chars * 2) / 1024;
+      if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB（${chars.toLocaleString()} 字符）`;
+      return `${(kb / 1024).toFixed(1)} MB（${chars.toLocaleString()} 字符）`;
+    }
+
+    /**
+     * 设置 → 插件 → 固定片段：只读的"已用存储"面板。
+     *
+     * Read-only on purpose: the first settings page answers "how much room do I take",
+     * and nothing on it can destroy data. Every number is re-derived from `localStorage`
+     * on mount, on every store change, and on demand, so there is no cached figure that
+     * can quietly drift from reality.
+     */
+    function StorageSettingsTab() {
+      const [reading, setReading] = React.useState(() => measureStorage());
+      React.useEffect(() => store.subscribe(() => setReading(measureStorage())), []);
+      const refresh = React.useCallback(() => setReading(measureStorage()), []);
+      const percent = (share) => `约 ${(share * 100).toFixed(share < 0.1 ? 1 : 0)}%`;
+      const barState = reading.allShare >= 1 ? 'is-full' : reading.allShare >= 0.9 ? 'is-warn' : '';
+
+      return h(
+        'div',
+        { className: 'dsh-pins-settings', 'data-dsh-pins': '' },
+        h('h3', null, '已用存储'),
+        reading.unavailable
+          ? h(
+              'div',
+              { className: 'warn' },
+              '这个页面不允许访问本地存储：占用无法统计，片段也不会被保存。',
+            )
+          : null,
+        h(
+          'div',
+          { className: 'row' },
+          h('span', { className: 'k' }, '本插件'),
+          h(
+            'span',
+            { className: 'v' },
+            `${reading.pinCount} 条片段 · ${formatChars(reading.ours)} · ${percent(reading.oursShare)}`,
+          ),
+        ),
+        h(
+          'div',
+          { className: 'row' },
+          h('span', { className: 'k' }, '本站总计'),
+          h(
+            'span',
+            { className: 'v' },
+            `${reading.keys} 个键 · ${formatChars(reading.all)} · ${percent(reading.allShare)}`,
+          ),
+        ),
+        h(
+          'div',
+          { className: `dsh-pins-meter ${barState}`.trim(), role: 'img', 'aria-label': `本站存储已用 ${percent(reading.allShare)}` },
+          h('i', { style: { width: `${Math.min(100, reading.allShare * 100).toFixed(1)}%` } }),
+        ),
+        reading.allShare >= 0.9
+          ? h(
+              'div',
+              { className: 'warn', role: 'status' },
+              reading.allShare >= 1
+                ? '本站存储已满：新的固定不会保存。删掉一些片段，或清理这个站点的数据后重试。'
+                : '本站存储已用约 90% 以上：再存内容可能失败，建议先清理。',
+            )
+          : null,
+        h('div', { className: 'row' }, h('button', { type: 'button', className: 'mini', onClick: refresh }, '重新统计')),
+        h(
+          'p',
+          { className: 'hint' },
+          '片段存在这个站点的浏览器存储里，不上传、不同步；清除「Cookie 及其他网站数据」会一并清掉，换端口或域名访问也看不到同一份。',
+        ),
+        h(
+          'p',
+          { className: 'hint' },
+          `百分比按本站存储的字符数 ÷ 约 ${(STORAGE_CHARS_LIMIT / 10000).toFixed(0)} 万估算，不同浏览器的上限不同，所以标「约」。`,
+        ),
+        reading.ourKeys > 0
+          ? h('p', { className: 'hint' }, `本插件目前占用 ${reading.ourKeys} 个存储键。`)
+          : null,
+      );
     }
 
     //#endregion
@@ -5121,6 +5523,27 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           );
         } catch (error) {
           console.error('[dsh-pins] 左栏入口注册失败', error);
+        }
+      }
+
+      // 设置 → 插件 → 固定片段：只读的占用统计。
+      //
+      // `settings.plugins.tab` is declared by the Plugins settings **section**, so it exists
+      // only while that section is mounted — hence `slots.inject`, like every other
+      // contribution here. If the settings plugin package is disabled the tab simply is not
+      // offered; nothing else in the plugin depends on it.
+      if (slots && typeof slots.inject === 'function' && typeof slots.register === 'function') {
+        try {
+          own(
+            slots.inject('settings.plugins.tab', () =>
+              slots.register(
+                { name: 'settings.plugins.tab', id: PKG, order: 40, label: '固定片段' },
+                () => h(StorageSettingsTab),
+              ),
+            ),
+          );
+        } catch (error) {
+          console.error('[dsh-pins] 设置页注册失败', error);
         }
       }
 
