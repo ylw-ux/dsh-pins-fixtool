@@ -2381,18 +2381,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const [active, setActive] = React.useState(-1);
       const [moved, setMoved] = React.useState(false);
       const [listClosed, setListClosed] = React.useState(false);
-      const composingRef = React.useRef(false);
-      const lastRowsRef = React.useRef([]);
+      const [composing, setComposing] = React.useState(false);
+      const [frozenRows, setFrozenRows] = React.useState([]);
       const inputRef = React.useRef(null);
 
       // Ranked only while the box is open. The vocabulary is read fresh rather than
       // cached: tags live on pins, and a stale list would offer a tag that was just
       // deleted.
       const filteredRows = tagging ? suggestTags(tagVocabulary(), draft, new Set(takenTags ?? [])) : [];
-      if (!composingRef.current) lastRowsRef.current = filteredRows;
-      // Same rule as the panel's editor: pinyin in the box is not a tag, so the rows from
-      // before the composition stay on screen instead of flickering empty.
-      const suggestRows = listClosed ? [] : composingRef.current ? lastRowsRef.current : filteredRows;
+      // Same rule as the panel's editor, and the same reason it is state: the final input
+      // event of an IME may arrive before compositionend, so a ref freeze would survive with
+      // nothing left to re-render it.
+      const suggestRows = listClosed ? [] : composing ? frozenRows : filteredRows;
 
       // Mount/unmount in the log: a bar that appears and disappears while the user is
       // still working is exactly what the reason strings are meant to name.
@@ -2526,16 +2526,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               setActive(-1);
               setMoved(false);
               setListClosed(false);
+              if (event.nativeEvent?.isComposing !== true) setComposing(false);
             },
             onCompositionStart: () => {
-              composingRef.current = true;
+              setComposing(true);
+              setFrozenRows(suggestRows);
             },
-            onCompositionEnd: (event) => {
-              composingRef.current = false;
-              setDraft(event.currentTarget.value);
-              setActive(-1);
-              setMoved(false);
-            },
+            onCompositionEnd: () => setComposing(false),
             onKeyDown: (event) =>
               tagKeyDown(event, {
                 rows: suggestRows,
@@ -2968,6 +2965,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           dismissBar('选区没了（点了别处或浏览器清了选区）');
         };
         const onKeyDown = (event) => {
+          // The tag box runs its own Escape chain (close the list, then the box). This
+          // listener is in the capture phase, so acting here first collapsed both steps into
+          // one and the box vanished on the first press.
+          if (event.target?.closest?.('.dsh-pins-bar input')) return;
           if (event.key === 'Escape' && stateRef.current) {
             dismissBar('按了 Esc');
             return;
@@ -3118,7 +3119,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     const CARD_GUARD = {
       onMouseDown: (event) => {
         const editor = event.currentTarget.querySelector('.tagrow');
-        if (editor && editor.contains(event.target)) event.preventDefault();
+        if (!editor || !editor.contains(event.target)) return;
+        // The input keeps its own click. Preventing the default is what keeps focus while a
+        // chip or the trash inside the editor is clicked — but applying it to the input
+        // itself made a blurred editor impossible to click back into: the browser never got
+        // to focus it, so the box looked dead.
+        if (event.target.closest?.('input, textarea')) return;
+        event.preventDefault();
       },
     };
 
@@ -3232,6 +3239,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     function tagKeyDown(event, state) {
       // An IME commit is Enter too; submitting there would cut the composition short.
       if (event.nativeEvent?.isComposing === true) return;
+      // A space is part of a tag name. The card root treats Space as "activate the card",
+      // so the keystroke is stopped here — without preventing the default, which is what
+      // inserts the character.
+      if (event.key === ' ') {
+        event.stopPropagation();
+        return;
+      }
       const rows = state.rows ?? [];
       const open = rows.length > 0 && state.listClosed !== true;
       if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && open) {
@@ -3250,12 +3264,19 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       }
       if (event.key === 'Enter') {
         event.preventDefault();
+        // The card root also listens for Enter (it activates or jumps the card). The tag
+        // box owns Enter while it is focused, so the event must not reach that handler.
+        event.stopPropagation();
         const row = state.moved === true && state.active >= 0 ? rows[state.active] : null;
         state.onSubmit(row && !row.taken ? row.tag : undefined);
         return;
       }
       if (event.key === 'Escape') {
         event.preventDefault();
+        // Escape is a two-step gesture here: close the list, then the box. Without this the
+        // bar's capture-phase document listener (and the card root) would also act, so both
+        // steps happened at once and the box vanished on the first press.
+        event.stopPropagation();
         if (open) {
           state.onCloseList(true);
           return;
@@ -4098,8 +4119,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const [active, setActive] = React.useState(-1);
       const [moved, setMoved] = React.useState(false);
       const [listClosed, setListClosed] = React.useState(false);
-      const composingRef = React.useRef(false);
-      const lastRowsRef = React.useRef([]);
+      const [composing, setComposing] = React.useState(false);
+      const [frozenRows, setFrozenRows] = React.useState([]);
       const rootRef = React.useRef(null);
       const open = cardState?.isOpen?.(pin.id) === true;
       const managing = cardState?.isManaging?.(pin.id) === true;
@@ -4109,11 +4130,11 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // store fresh keeps the list right after a tag is added from anywhere else.
       const filteredRows =
         managing && taggable ? suggestTags(tagVocabulary(), draft, new Set(pin.tags ?? [])) : [];
-      if (!composingRef.current) lastRowsRef.current = filteredRows;
-      // While an IME composition is in progress the box holds pinyin, not a tag. Matching
-      // against it would empty the list on every keystroke and repopulate it on commit, so
-      // the rows from before the composition started stay on screen instead.
-      const suggestRows = listClosed ? [] : composingRef.current ? lastRowsRef.current : filteredRows;
+      // Freezing is state, not a ref. An IME often fires the final input event — whose value
+      // is already the committed text — *before* `compositionend`, so flipping a ref there
+      // left the frozen rows on screen with no further render to clear them: the list only
+      // refreshed after the next keystroke.
+      const suggestRows = listClosed ? [] : composing ? frozenRows : filteredRows;
 
       React.useLayoutEffect(() => {
         // An expanded card near the bottom of the list would otherwise grow past the
@@ -4415,15 +4436,28 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                   setActive(-1);
                   setMoved(false);
                   setListClosed(false);
+                  // Belt and braces: some IMEs commit without a compositionend we can see.
+                  if (event.nativeEvent?.isComposing !== true) setComposing(false);
                 },
                 onCompositionStart: () => {
-                  composingRef.current = true;
+                  setComposing(true);
+                  setFrozenRows(suggestRows);
                 },
-                onCompositionEnd: (event) => {
-                  composingRef.current = false;
-                  setDraft(event.currentTarget.value);
+                onCompositionEnd: () => setComposing(false),
+                onBlur: (event) => {
+                  // Leaving the box closes the editor: a box that stays open but cannot be
+                  // typed into reads as a broken control. A blur into another control of the
+                  // same card (the tag toggle, the chips) is not "leaving" — those keep the
+                  // editor open on purpose, and a row click prevents the default of
+                  // mousedown, so it never blurs at all.
+                  const next = event.relatedTarget;
+                  if (next && event.currentTarget.closest('.dsh-pins-card')?.contains(next)) return;
+                  if (!managing) return;
+                  setDraft('');
                   setActive(-1);
                   setMoved(false);
+                  setListClosed(false);
+                  cardState?.toggleManage?.(pin.id);
                 },
                 onKeyDown: (event) =>
                   tagKeyDown(event, {
