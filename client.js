@@ -73,6 +73,17 @@ window.__ModuleLoader__.load({
      * A record written by this version always answers from `anchor.truncated` instead.
      */
     const LEGACY_MAX_CHARS = 600;
+    /**
+     * Geometry of the tag suggestion list.
+     *
+     * The panel has room for six rows; the floating bar does not, so it shows three and
+     * scrolls. Both are *visible* row counts — the list always renders every match and
+     * caps only its own height, because a list that silently truncates its matches would
+     * hide the tag the user is looking for.
+     */
+    const SUGGEST_ROWS_PANEL = 6;
+    const SUGGEST_ROWS_BAR = 3;
+    const SUGGEST_ROW_HEIGHT = 26;
     const TOOLBAR_HEIGHT = 40;
     const TOOLBAR_WIDTH = 220;
     /** How far from the recorded offset a re-located passage may sit, in characters. */
@@ -431,6 +442,57 @@ window.__ModuleLoader__.load({
 
     function normalizeTag(value) {
       return String(value ?? '').trim().replace(/^#+/, '').replace(/\s+/g, ' ').slice(0, 24);
+    }
+
+    /**
+     * Every tag in the store, with how many pins carry it.
+     *
+     * Tags are a cross-Session vocabulary — `#重要` means the same thing in every
+     * conversation — so suggestions ignore the panel's per-Session scoping. Deleting keeps
+     * its scoping (the tag manager explains why); suggesting and deleting are different
+     * promises.
+     */
+    function tagVocabulary() {
+      const counts = new Map();
+      for (const [, entry] of store.sessions()) {
+        for (const pin of entry.pins ?? []) {
+          for (const tag of pin.tags ?? []) {
+            const name = String(tag);
+            counts.set(name, (counts.get(name) ?? 0) + 1);
+          }
+        }
+      }
+      return [...counts.entries()].map(([tag, count]) => ({ tag, count }));
+    }
+
+    /**
+     * Rank the vocabulary against what has been typed so far.
+     *
+     * Matching is case-insensitive even though two tags differing only in case are two
+     * separate records: nobody types a capital to find a lowercase tag. Prefix hits rank
+     * above interior hits, then the more used tag, then locale order, so the list stays
+     * stable while the user types.
+     *
+     * @param taken - tags already on the pin. They are listed and marked rather than
+     *   hidden: "that tag exists but you already have it" is the useful answer.
+     */
+    function suggestTags(vocabulary, draft, taken) {
+      const needle = normalizeTag(draft).toLowerCase();
+      if (needle === '') return [];
+      const used = taken instanceof Set ? taken : new Set();
+      const rows = [];
+      for (const entry of vocabulary) {
+        const at = entry.tag.toLowerCase().indexOf(needle);
+        if (at < 0) continue;
+        rows.push({ tag: entry.tag, count: entry.count, hit: at, taken: used.has(entry.tag) });
+      }
+      rows.sort((left, right) => {
+        const rank = (row) => (row.hit === 0 ? 0 : 1);
+        if (rank(left) !== rank(right)) return rank(left) - rank(right);
+        if (left.count !== right.count) return right.count - left.count;
+        return left.tag.localeCompare(right.tag, 'zh-Hans-CN');
+      });
+      return rows;
     }
 
     function matchesQuery(pin, query) {
@@ -2127,6 +2189,38 @@ window.__ModuleLoader__.load({
   transition:border-color 140ms cubic-bezier(0,0,.2,1),box-shadow 140ms cubic-bezier(0,0,.2,1)}
 .dsh-pins-card .tagrow input:focus{border-color:var(--dsw-alias-brand-primary);
   box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent)}
+/* Tag suggestions. In flow (see TagSuggest): no clipping, no coordinate maths.
+   Optical alignment: rows are inset 3px + 6px = 9px so the names line up with the input's
+   text (1px border + 8px padding), not with the input's border. */
+.dsh-pins-suggest{margin:6px 0 0;padding:3px;border:1px solid var(--dsw-alias-border-l1);
+  border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-2);
+  box-shadow:var(--dsw-elevation-soft);overflow-y:auto;overscroll-behavior:contain;
+  scrollbar-width:thin}
+.dsh-pins-bar .dsh-pins-suggest{flex:1 0 100%;background:var(--dsw-alias-bg-overlay)}
+.dsh-pins-suggest .row{display:flex;align-items:baseline;gap:4px;min-height:26px;
+  box-sizing:border-box;padding:4px 6px;border-radius:var(--dsw-radius-xs);cursor:pointer;
+  color:var(--dsw-alias-label-primary);font-size:var(--dsw-font-xxs-12-font-size,12px);
+  line-height:18px}
+.dsh-pins-suggest .row[aria-selected="true"]{background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-suggest .row[data-taken]{color:var(--dsw-alias-label-tertiary);cursor:default}
+.dsh-pins-suggest .hash{flex:none;color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-suggest .name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsh-pins-suggest .count{flex:none;margin-left:auto;color:var(--dsw-alias-label-tertiary);
+  font-variant-numeric:tabular-nums;font-size:var(--dsw-font-xxxs-11-font-size,11px)}
+.dsh-pins-create{display:block;width:100%;margin:2px 0 0;padding:4px 9px;box-sizing:border-box;
+  border:0;border-top:1px solid var(--dsw-alias-border-l1);background:0 0;text-align:left;
+  color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);cursor:pointer}
+.dsh-pins-create:hover{color:var(--dsw-alias-label-primary)}
+.dsh-pins-create:focus-visible{outline:none;
+  box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),
+    0 0 0 4px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary))}
+/* The bar is a wrapped flex row, so the list and the create row take a full line of their
+   own rather than being squeezed beside the 104px input. */
+.dsh-pins-bar .dsh-pins-create{flex:1 0 100%}
+/* The card's tagrow already spaces its children by 6px; the list does not need a second
+   gap on top of that. */
+.dsh-pins-card .tagrow .dsh-pins-suggest{margin-top:2px}
 .dsh-pins-root .empty{margin:28px 16px;color:var(--dsw-alias-label-secondary);line-height:1.8;
   text-align:center;font-size:var(--dsw-font-xs-13-font-size,13px)}
 .dsh-pins-root .empty b{display:block;margin-bottom:8px;color:var(--dsw-alias-label-primary);
@@ -2281,10 +2375,24 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#region floating action bar
 
-    function Toolbar({ state, onAction }) {
+    function Toolbar({ state, onAction, takenTags }) {
       const [tagging, setTagging] = React.useState(false);
       const [draft, setDraft] = React.useState('');
+      const [active, setActive] = React.useState(-1);
+      const [moved, setMoved] = React.useState(false);
+      const [listClosed, setListClosed] = React.useState(false);
+      const composingRef = React.useRef(false);
+      const lastRowsRef = React.useRef([]);
       const inputRef = React.useRef(null);
+
+      // Ranked only while the box is open. The vocabulary is read fresh rather than
+      // cached: tags live on pins, and a stale list would offer a tag that was just
+      // deleted.
+      const filteredRows = tagging ? suggestTags(tagVocabulary(), draft, new Set(takenTags ?? [])) : [];
+      if (!composingRef.current) lastRowsRef.current = filteredRows;
+      // Same rule as the panel's editor: pinyin in the box is not a tag, so the rows from
+      // before the composition stay on screen instead of flickering empty.
+      const suggestRows = listClosed ? [] : composingRef.current ? lastRowsRef.current : filteredRows;
 
       // Mount/unmount in the log: a bar that appears and disappears while the user is
       // still working is exactly what the reason strings are meant to name.
@@ -2315,6 +2423,29 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           return;
         }
         setDraft('');
+        setTagging(false);
+        onAction({ type: 'tag', tag });
+      };
+
+      /**
+       * Apply a tag picked from the list, or commit the typed text when none was picked.
+       *
+       * The bar closes after applying, unlike the card's editor: it is a transient strip
+       * anchored to a selection, and staying open would keep the selection hostage.
+       */
+      const applyTag = (picked) => {
+        if (picked === undefined) {
+          submitTag();
+          return;
+        }
+        const tag = normalizeTag(picked);
+        if (tag === '') {
+          submitTag();
+          return;
+        }
+        setDraft('');
+        setActive(-1);
+        setMoved(false);
         setTagging(false);
         onAction({ type: 'tag', tag });
       };
@@ -2384,17 +2515,66 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             ref: inputRef,
             value: draft,
             placeholder: '标签，回车',
-            onChange: (event) => setDraft(event.target.value),
-            onKeyDown: (event) => {
-              if (event.key === 'Enter') {
-                event.preventDefault();
-                submitTag();
-              } else if (event.key === 'Escape') {
-                event.preventDefault();
-                setTagging(false);
-              }
+            role: 'combobox',
+            'aria-autocomplete': 'list',
+            'aria-expanded': suggestRows.length > 0 ? 'true' : 'false',
+            'aria-controls': 'dsh-pins-suggest-bar',
+            'aria-activedescendant':
+              active >= 0 && suggestRows[active] ? `dsh-pins-suggest-bar-${active}` : undefined,
+            onChange: (event) => {
+              setDraft(event.target.value);
+              setActive(-1);
+              setMoved(false);
+              setListClosed(false);
             },
+            onCompositionStart: () => {
+              composingRef.current = true;
+            },
+            onCompositionEnd: (event) => {
+              composingRef.current = false;
+              setDraft(event.currentTarget.value);
+              setActive(-1);
+              setMoved(false);
+            },
+            onKeyDown: (event) =>
+              tagKeyDown(event, {
+                rows: suggestRows,
+                active,
+                moved,
+                listClosed,
+                onActive: setActive,
+                onMoved: setMoved,
+                onCloseList: setListClosed,
+                onSubmit: applyTag,
+                onEscape: () => setTagging(false),
+              }),
           }),
+          h(TagSuggest, {
+            key: 'tag-suggest',
+            idPrefix: 'dsh-pins-suggest-bar',
+            rows: suggestRows,
+            active,
+            maxRows: SUGGEST_ROWS_BAR,
+            onPick: applyTag,
+            onHover: setActive,
+          }),
+          normalizeTag(draft) !== '' && !listClosed
+            ? h(
+                'button',
+                {
+                  key: 'tag-create',
+                  type: 'button',
+                  className: 'dsh-pins-create',
+                  tabIndex: -1,
+                  title: `创建新标签 #${normalizeTag(draft)}（回车也可以）`,
+                  onMouseDown: (event) => {
+                    event.preventDefault();
+                    applyTag();
+                  },
+                },
+                `创建 #${normalizeTag(draft)}`,
+              )
+            : null,
         );
       }
 
@@ -2437,9 +2617,23 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       );
 
       const rect = state.rect;
-      const above = rect ? rect.top - TOOLBAR_HEIGHT - 8 : 0;
-      const below = rect ? window.innerHeight - rect.bottom + 8 : 0;
-      const top = above >= 8 ? above : below;
+      // The bar grows when the tag box or its suggestion list opens, so its own height is
+      // part of the placement — a constant 40px put the list off-screen. The list height is
+      // exact (rows x row height + padding); the toolbar rows are estimated and then
+      // clamped, because they wrap and their height depends on their content.
+      const listHeight =
+        suggestRows.length > 0 ? Math.min(suggestRows.length, SUGGEST_ROWS_BAR) * SUGGEST_ROW_HEIGHT + 6 : 0;
+      const barHeight = TOOLBAR_HEIGHT + (tagging ? 30 : 0) + listHeight;
+      const above = rect ? rect.top - barHeight - 8 : 0;
+      // This used to be the *distance* to the bottom (innerHeight - rect.bottom + 8) and was
+      // then used as a top coordinate: a selection near the top threw the bar into the
+      // middle of the screen. The coordinate under the selection is what is wanted.
+      const below = rect ? rect.bottom + 8 : 8;
+      const top = rect
+        ? above >= 8
+          ? above
+          : Math.max(8, Math.min(below, window.innerHeight - barHeight - 8))
+        : 8;
       const left = rect ? Math.max(8, Math.min(rect.left + rect.width / 2 - TOOLBAR_WIDTH / 2, window.innerWidth - TOOLBAR_WIDTH - 8)) : 8;
 
       return h(
@@ -2825,10 +3019,20 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         };
       }, [accept, dismissBar]);
 
+      // Tags already on the passage under the bar, so the suggestion list can mark them
+      // instead of offering an add that would be a no-op.
+      const takenTags = React.useMemo(() => {
+        if (!state) return [];
+        const target = liveSession();
+        if (!target) return [];
+        const existing = findExistingPin(store, target, state.anchor);
+        return (existing && existing.tags) || [];
+      }, [state, liveSession]);
+
       return h(
         React.Fragment,
         null,
-        state ? h(Toolbar, { state, onAction }) : null,
+        state ? h(Toolbar, { state, onAction, takenTags }) : null,
         h(ReturnPill, { context }),
         notice !== ''
           ? h(
@@ -2963,6 +3167,101 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      */
     function announceHere(text, kind = 'info') {
       PINS_EVENTS.dispatchEvent(new CustomEvent('notice', { detail: { text, surface: 'floating', kind } }));
+    }
+
+    /**
+     * One row per matching tag, under the input being typed into.
+     *
+     * Rendered **in flow**, never as a popover: the panel's list scrolls and anything
+     * absolutely positioned inside it is clipped, while the floating bar is a wrapped flex
+     * row where a popover would need coordinate maths that goes stale on scroll. Growing
+     * the container is the honest layout, and it keeps the list inside the same scroll
+     * container as the input.
+     *
+     * Optical alignment rather than mathematical: row text is inset 3 + 6 = 9px to match
+     * the input's *text* edge (1px border + 8px padding), because the eye aligns the words,
+     * not the boxes. The count column is right-aligned with tabular figures so it does not
+     * shift as the numbers change.
+     */
+    function TagSuggest({ idPrefix, rows, active, maxRows, onPick, onHover }) {
+      if (rows.length === 0) return null;
+      return h(
+        'div',
+        {
+          className: 'dsh-pins-suggest',
+          role: 'listbox',
+          'aria-label': '已有标签',
+          style: { maxHeight: `${maxRows * SUGGEST_ROW_HEIGHT}px` },
+        },
+        rows.map((row, index) =>
+          h(
+            'div',
+            {
+              key: row.tag,
+              id: `${idPrefix}-${index}`,
+              className: 'row',
+              role: 'option',
+              'aria-selected': index === active ? 'true' : 'false',
+              'data-taken': row.taken ? '' : undefined,
+              title: row.taken ? `这个片段已经有 #${row.tag}` : `#${row.tag}`,
+              // mousedown, not click: the input would blur first and the list would close
+              // before the pick lands.
+              onMouseDown: (event) => {
+                event.preventDefault();
+                if (!row.taken) onPick(row.tag);
+              },
+              onMouseEnter: () => onHover(index),
+            },
+            h('span', { className: 'hash' }, '#'),
+            h('span', { className: 'name' }, row.tag),
+            h('span', { className: 'count' }, row.taken ? '已有' : String(row.count)),
+          ),
+        ),
+      );
+    }
+
+    /**
+     * Key handling shared by both tag inputs.
+     *
+     * Arrow keys belong to the suggestion list while it has rows: they are swallowed here
+     * (`preventDefault` + `stopPropagation`) so the outer list — the cards, the
+     * conversation — never moves under them. Enter applies the highlighted row **only when
+     * the user moved with the arrows**; otherwise it commits what was typed, so typing
+     * `gu` and pressing Enter creates `#gu` instead of silently becoming `#固定`.
+     */
+    function tagKeyDown(event, state) {
+      // An IME commit is Enter too; submitting there would cut the composition short.
+      if (event.nativeEvent?.isComposing === true) return;
+      const rows = state.rows ?? [];
+      const open = rows.length > 0 && state.listClosed !== true;
+      if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && open) {
+        event.preventDefault();
+        event.stopPropagation();
+        const step = event.key === 'ArrowDown' ? 1 : -1;
+        const next =
+          state.active < 0
+            ? step > 0
+              ? 0
+              : rows.length - 1
+            : (state.active + step + rows.length) % rows.length;
+        state.onActive(next);
+        state.onMoved(true);
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const row = state.moved === true && state.active >= 0 ? rows[state.active] : null;
+        state.onSubmit(row && !row.taken ? row.tag : undefined);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        if (open) {
+          state.onCloseList(true);
+          return;
+        }
+        state.onEscape();
+      }
     }
 
     /**
@@ -3796,9 +4095,25 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      */
     function PinCard({ sessionId, pin, current, taggable, onTagChange, onQuote, context, cardState, foreign }) {
       const [draft, setDraft] = React.useState('');
+      const [active, setActive] = React.useState(-1);
+      const [moved, setMoved] = React.useState(false);
+      const [listClosed, setListClosed] = React.useState(false);
+      const composingRef = React.useRef(false);
+      const lastRowsRef = React.useRef([]);
       const rootRef = React.useRef(null);
       const open = cardState?.isOpen?.(pin.id) === true;
       const managing = cardState?.isManaging?.(pin.id) === true;
+
+      // Ranked per keystroke over the whole vocabulary. Only the card being edited
+      // computes this, so the cost is one pass rather than one per card, and reading the
+      // store fresh keeps the list right after a tag is added from anywhere else.
+      const filteredRows =
+        managing && taggable ? suggestTags(tagVocabulary(), draft, new Set(pin.tags ?? [])) : [];
+      if (!composingRef.current) lastRowsRef.current = filteredRows;
+      // While an IME composition is in progress the box holds pinyin, not a tag. Matching
+      // against it would empty the list on every keystroke and repopulate it on commit, so
+      // the rows from before the composition started stay on screen instead.
+      const suggestRows = listClosed ? [] : composingRef.current ? lastRowsRef.current : filteredRows;
 
       React.useLayoutEffect(() => {
         // An expanded card near the bottom of the list would otherwise grow past the
@@ -3817,6 +4132,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         const tag = normalizeTag(draft);
         const typed = draft.trim() !== '';
         setDraft('');
+        setActive(-1);
+        setMoved(false);
         if (tag === '') {
           // Typing only `#` normalized to nothing; say so instead of clearing the box
           // and appearing to have accepted it. This happens in the panel, so the panel
@@ -3826,6 +4143,27 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         }
         const added = onTagChange('add', tag);
         // Adding never removes, so say why nothing happened instead of toggling.
+        if (added === false) announce(`已经有 #${tag} 这个标签了`);
+      };
+
+      /**
+       * Apply a tag picked from the list, or commit the typed text when none was picked.
+       *
+       * Picking keeps the editor open and clears the box, because adding two tags in a row
+       * is the common case.
+       */
+      const applyTag = (picked) => {
+        if (picked === undefined) {
+          submit();
+          return;
+        }
+        const tag = normalizeTag(picked);
+        setDraft('');
+        setActive(-1);
+        setMoved(false);
+        setListClosed(false);
+        if (tag === '') return;
+        const added = onTagChange('add', tag);
         if (added === false) announce(`已经有 #${tag} 这个标签了`);
       };
 
@@ -4066,18 +4404,67 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                 autoFocus: true,
                 value: draft,
                 placeholder: (pin.tags ?? []).length > 0 ? '再加标签，回车' : '标签，回车',
-                onChange: (event) => setDraft(event.target.value),
-                onKeyDown: (event) => {
-                  if (event.key === 'Enter') {
-                    event.preventDefault();
-                    submit();
-                  } else if (event.key === 'Escape') {
-                    event.preventDefault();
-                    setDraft('');
-                    cardState?.toggleManage?.(pin.id);
-                  }
+                role: 'combobox',
+                'aria-autocomplete': 'list',
+                'aria-expanded': suggestRows.length > 0 ? 'true' : 'false',
+                'aria-controls': `dsh-pins-suggest-${pin.id}`,
+                'aria-activedescendant':
+                  active >= 0 && suggestRows[active] ? `dsh-pins-suggest-${pin.id}-${active}` : undefined,
+                onChange: (event) => {
+                  setDraft(event.target.value);
+                  setActive(-1);
+                  setMoved(false);
+                  setListClosed(false);
                 },
+                onCompositionStart: () => {
+                  composingRef.current = true;
+                },
+                onCompositionEnd: (event) => {
+                  composingRef.current = false;
+                  setDraft(event.currentTarget.value);
+                  setActive(-1);
+                  setMoved(false);
+                },
+                onKeyDown: (event) =>
+                  tagKeyDown(event, {
+                    rows: suggestRows,
+                    active,
+                    moved,
+                    listClosed,
+                    onActive: setActive,
+                    onMoved: setMoved,
+                    onCloseList: setListClosed,
+                    onSubmit: applyTag,
+                    onEscape: () => {
+                      setDraft('');
+                      cardState?.toggleManage?.(pin.id);
+                    },
+                  }),
               }),
+              h(TagSuggest, {
+                idPrefix: `dsh-pins-suggest-${pin.id}`,
+                rows: suggestRows,
+                active,
+                maxRows: SUGGEST_ROWS_PANEL,
+                onPick: applyTag,
+                onHover: setActive,
+              }),
+              normalizeTag(draft) !== '' && !listClosed
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-pins-create',
+                      tabIndex: -1,
+                      title: `创建新标签 #${normalizeTag(draft)}（回车也可以）`,
+                      onMouseDown: (event) => {
+                        event.preventDefault();
+                        applyTag();
+                      },
+                    },
+                    `创建 #${normalizeTag(draft)}`,
+                  )
+                : null,
               h(TagManager, {
                 title: '管理这个片段的标签',
                 tags: pin.tags ?? [],
