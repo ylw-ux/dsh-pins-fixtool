@@ -52,6 +52,17 @@ window.__ModuleLoader__.load({
     const STATE_KEY = 'dsh-pins/v1';
     const MODE_KEY = 'dsh-pins/mode';
     /**
+     * Standalone tags: names the user created before any passage used them.
+     *
+     * Kept in its own key on purpose. The main blob is rewritten wholesale by every
+     * mutation, and an older build's `normalizeData` keeps only the fields it knows — so a
+     * list stored inside the blob would be dropped by a downgraded build on its next write.
+     * A key the older build has never heard of is never touched by it.
+     */
+    const EXTRA_TAGS_KEY = 'dsh-pins/extra-tags';
+    /** A vocabulary, not a dataset: past this the list stops being something one can scan. */
+    const MAX_EXTRA_TAGS = 200;
+    /**
      * How much of one selection is stored, in characters.
      *
      * 600 → 2000 (2026-11-05). The old figure was a storage cap, not a reading preference:
@@ -445,6 +456,29 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Read the standalone-tag key.
+     *
+     * Anything unusable is dropped rather than repaired: the list is the user's own
+     * vocabulary, and an entry that is not a plain string cannot be guessed at. A missing
+     * or malformed key is simply "no extra tags" — this is an optional feature, never an
+     * error.
+     */
+    function normalizeExtraTags(raw) {
+      if (!Array.isArray(raw)) return [];
+      const seen = new Set();
+      const rows = [];
+      for (const value of raw) {
+        if (typeof value !== 'string') continue;
+        const tag = normalizeTag(value);
+        if (tag === '' || seen.has(tag)) continue;
+        seen.add(tag);
+        rows.push(tag);
+        if (rows.length >= MAX_EXTRA_TAGS) break;
+      }
+      return rows;
+    }
+
+    /**
      * Every tag in the store, with how many pins carry it.
      *
      * Tags are a cross-Session vocabulary — `#重要` means the same thing in every
@@ -461,6 +495,11 @@ window.__ModuleLoader__.load({
             counts.set(name, (counts.get(name) ?? 0) + 1);
           }
         }
+      }
+      for (const tag of store.extraTags()) {
+        // A tag created before any passage used it still belongs to the vocabulary: that is
+        // what makes a pre-created name show up in every autocomplete with a count of zero.
+        if (!counts.has(tag)) counts.set(tag, 0);
       }
       return [...counts.entries()].map(([tag, count]) => ({ tag, count }));
     }
@@ -540,6 +579,9 @@ window.__ModuleLoader__.load({
      */
     function createStore() {
       let data = normalizeData(readJson(STATE_KEY, null));
+      // Read once at start; every extra-tag mutation rewrites this key alone, so the main
+      // blob's write path is untouched by the feature.
+      let extraTags = normalizeExtraTags(readJson(EXTRA_TAGS_KEY, null));
       const listeners = new Set();
       /**
        * Why the last persistence attempt failed, or `''` when it succeeded.
@@ -615,6 +657,22 @@ window.__ModuleLoader__.load({
         return persistOk;
       };
 
+      /** The same reporting path as `commit`, for the standalone-tag key alone. */
+      const commitExtraTags = () => {
+        let failure = '';
+        try {
+          if (globalThis.localStorage === undefined) throw new Error('localStorage unavailable');
+          globalThis.localStorage.setItem(EXTRA_TAGS_KEY, JSON.stringify(extraTags));
+        } catch (error) {
+          failure = describeFailure(error);
+          console.error('[dsh-pins] 保存标签清单失败', error);
+        }
+        persistError = failure;
+        persistOk = failure === '';
+        notify();
+        return persistOk;
+      };
+
       const sessionOf = (sessionId, create) => {
         const key = String(sessionId);
         let entry = data.sessions[key];
@@ -648,6 +706,34 @@ window.__ModuleLoader__.load({
          */
         storageStatus() {
           return { ok: persistOk && persistError === '', error: persistError };
+        },
+        /** Standalone tags as stored, in creation order. */
+        extraTags() {
+          return extraTags.slice();
+        },
+        /**
+         * Add a standalone tag — a name saved before any passage uses it.
+         *
+         * @returns `{ ok, reason?, tag?, persisted? }`; `duplicate`, `full` and `empty`
+         *   are expected answers, not exceptions.
+         */
+        addExtraTag(tag) {
+          const name = normalizeTag(tag);
+          if (name === '') return { ok: false, reason: 'empty' };
+          if (extraTags.includes(name)) return { ok: false, reason: 'duplicate' };
+          if (extraTags.length >= MAX_EXTRA_TAGS) return { ok: false, reason: 'full' };
+          extraTags = [...extraTags, name];
+          commitExtraTags();
+          return { ok: true, tag: name, persisted: persistOk };
+        },
+        /** Forget a standalone tag; tags still carried by pins are unaffected. */
+        removeExtraTag(tag) {
+          const name = normalizeTag(tag);
+          const next = extraTags.filter((each) => each !== name);
+          if (next.length === extraTags.length) return false;
+          extraTags = next;
+          commitExtraTags();
+          return true;
         },
         /** Whether the most recent mutating call reached local storage. */
         lastPersisted: true,
@@ -1967,7 +2053,7 @@ window.__ModuleLoader__.load({
   white-space:nowrap;font-variant-numeric:tabular-nums}
 /* The header's action row: order switch and export, one compact row so the panel keeps
    its scarce vertical space for the pins themselves. */
-.dsh-pins-root .tools{display:flex;gap:6px}
+.dsh-pins-root .tools{display:flex;gap:6px;flex-wrap:wrap}
 .dsh-pins-root .tool{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 9px;
   border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:transparent;
   color:var(--dsw-alias-label-secondary);font:inherit;font-size:var(--dsw-font-xxs-12-font-size,12px);
@@ -2221,6 +2307,18 @@ window.__ModuleLoader__.load({
 /* The card's tagrow already spaces its children by 6px; the list does not need a second
    gap on top of that. */
 .dsh-pins-card .tagrow .dsh-pins-suggest{margin-top:2px}
+/* The "new tag" row under the panel's tools. Same input treatment as the card's tag box, so
+   the two places that accept a name look like the same control. */
+.dsh-pins-newtag{padding:6px 8px 8px}
+.dsh-pins-newtag input{width:100%;box-sizing:border-box;height:28px;padding:0 8px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);outline:none;
+  transition:border-color 140ms cubic-bezier(0,0,.2,1),box-shadow 140ms cubic-bezier(0,0,.2,1)}
+.dsh-pins-newtag input:focus{border-color:var(--dsw-alias-brand-primary);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent)}
+/* ×0 is information, not a problem: dim it instead of colouring it. */
+.dsh-pins-root .tagmgr-count[data-zero]{color:var(--dsw-alias-label-tertiary);opacity:.85}
 .dsh-pins-root .empty{margin:28px 16px;color:var(--dsw-alias-label-secondary);line-height:1.8;
   text-align:center;font-size:var(--dsw-font-xs-13-font-size,13px)}
 .dsh-pins-root .empty b{display:block;margin-bottom:8px;color:var(--dsw-alias-label-primary);
@@ -3215,7 +3313,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               // before the pick lands.
               onMouseDown: (event) => {
                 event.preventDefault();
-                if (!row.taken) onPick(row.tag);
+                // Taken rows are offered too: the caller's answer ("you already have it")
+                // is more useful than a click that silently does nothing.
+                onPick(row.tag);
               },
               onMouseEnter: () => onHover(index),
             },
@@ -3286,6 +3386,117 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     }
 
     /**
+     * The "new tag" row: a name saved before any passage uses it.
+     *
+     * Owns its own draft and keyboard state, so the panel does not carry six more pieces of
+     * state for a control that is open briefly. Enter creates and keeps the row open — the
+     * common case is seeding several names before filing anything — while Escape or a click
+     * elsewhere closes it.
+     */
+    function TagCreator({ vocabulary, onCreated, onClose }) {
+      const [draft, setDraft] = React.useState('');
+      const [active, setActive] = React.useState(-1);
+      const [moved, setMoved] = React.useState(false);
+      const [closed, setClosed] = React.useState(false);
+      const [composing, setComposing] = React.useState(false);
+      const [frozen, setFrozen] = React.useState([]);
+
+      const existing = new Set(vocabulary.map((row) => row.tag));
+      const filtered = suggestTags(vocabulary, draft, existing);
+      const rows = closed ? [] : composing ? frozen : filtered;
+
+      /**
+       * Create the typed name (or a picked one) and keep the row open.
+       *
+       * Picking a suggested row lands here too: every suggestion is an existing tag, so the
+       * answer is "you already have it" rather than a click that does nothing.
+       */
+      const create = (picked) => {
+        const raw = picked === undefined ? draft : picked;
+        const name = normalizeTag(raw);
+        if (name === '') {
+          announce('标签名不能只有 # 或空格', 'info');
+          return;
+        }
+        // Case-insensitive on purpose: two names differing only in case are separate
+        // records by design, but a second one is almost always a typo, so it is refused.
+        const clash = vocabulary.find((row) => row.tag.toLowerCase() === name.toLowerCase());
+        if (clash) {
+          announce(`已有 #${clash.tag}，换个名字吧`, 'info');
+          return;
+        }
+        const result = onCreated(name);
+        if (!result || result.ok !== true) {
+          announce(result?.reason === 'full' ? '标签太多了，先删掉一些再建' : '这个标签名没法用', 'info');
+          return;
+        }
+        setDraft('');
+        setActive(-1);
+        setMoved(false);
+        setClosed(false);
+        const cut = String(raw).trim().length > 24 ? '（超过 24 字的部分已省略）' : '';
+        announce(`已创建 #${result.tag}${cut}`, result.persisted === false ? 'error' : 'info');
+      };
+
+      return h(
+        'div',
+        { className: 'dsh-pins-newtag' },
+        h('input', {
+          autoFocus: true,
+          value: draft,
+          placeholder: '新标签名，回车创建（可连续）',
+          role: 'combobox',
+          'aria-autocomplete': 'list',
+          'aria-label': '新建标签',
+          'aria-expanded': rows.length > 0 ? 'true' : 'false',
+          'aria-controls': 'dsh-pins-newtag-suggest',
+          'aria-activedescendant':
+            active >= 0 && rows[active] ? `dsh-pins-newtag-suggest-${active}` : undefined,
+          onChange: (event) => {
+            setDraft(event.target.value);
+            setActive(-1);
+            setMoved(false);
+            setClosed(false);
+            if (event.nativeEvent?.isComposing !== true) setComposing(false);
+          },
+          onCompositionStart: () => {
+            setComposing(true);
+            setFrozen(rows);
+          },
+          onCompositionEnd: () => setComposing(false),
+          onBlur: (event) => {
+            // Clicking a suggestion or the toggle prevents the default of mousedown, so those
+            // never reach here; a real click elsewhere closes the row.
+            if (event.relatedTarget && event.currentTarget.closest('.dsh-pins-newtag')?.contains(event.relatedTarget)) {
+              return;
+            }
+            onClose();
+          },
+          onKeyDown: (event) =>
+            tagKeyDown(event, {
+              rows,
+              active,
+              moved,
+              listClosed: closed,
+              onActive: setActive,
+              onMoved: setMoved,
+              onCloseList: setClosed,
+              onSubmit: create,
+              onEscape: onClose,
+            }),
+        }),
+        h(TagSuggest, {
+          idPrefix: 'dsh-pins-newtag-suggest',
+          rows,
+          active,
+          maxRows: SUGGEST_ROWS_PANEL,
+          onPick: create,
+          onHover: setActive,
+        }),
+      );
+    }
+
+    /**
      * A collapsible tag manager.
      *
      * Tags are listed one per row with their full name, how many pins carry them,
@@ -3335,13 +3546,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                               type: 'button',
                               className: 'tagmgr-name filter',
                               title: active ? '取消这个筛选' : '只看带这个标签的片段',
-                              onClick: () => onToggleFilter(tag),
+                              onClick: () => onToggleFilter(tag, count),
                             },
                             `#${tag}`,
                           )
                         : h('span', { className: 'tagmgr-name' }, `#${tag}`),
-                      count > 0 ? h('span', { className: 'tagmgr-count' }, `×${count}`) : null,
-                      h(
+                      // Always rendered: a standalone tag's 「×0」 is how the user sees that the name
+            // was saved and simply has no passage yet.
+            h(
+              'span',
+              { className: 'tagmgr-count', 'data-zero': count === 0 ? '' : undefined },
+              `×${count}`,
+            ),                      h(
                         'button',
                         {
                           type: 'button',
@@ -4580,6 +4796,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       /** Answers already produced for one gesture; a retried request must not paste twice. */
       const handledRequests = React.useRef(new Map());
       const [sort, setSort] = React.useState(() => store.getSort());
+      /** Whether the standalone-tag row under the tools is open. */
+      const [creating, setCreating] = React.useState(false);
       /** Session groups the user folded shut, and the one a search result just revealed. */
       const [collapsed, setCollapsed] = React.useState(() => new Set());
       const [pulseId, setPulseId] = React.useState(null);
@@ -4963,7 +5181,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       }, [sessionId, turnOutline]);
 
       const toggleTagFilter = React.useCallback(
-        (tag) => {
+        (tag, count) => {
+          // A tag with no pins cannot match anything, so filtering by it would show an empty
+          // list and read as a broken control. Say why instead of doing nothing — but still
+          // allow clearing a filter that is already on.
+          if (count === 0 && !tagFilter.has(tag)) {
+            announce(`标签 #${tag} 还没有对应片段：先给片段加上它，再按标签筛选`, 'info');
+            return;
+          }
           setTagFilter((current) => {
             const next = new Set(current);
             if (next.has(tag)) next.delete(tag);
@@ -4971,7 +5196,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             return next;
           });
         },
-        [setTagFilter],
+        [setTagFilter, tagFilter],
       );
 
       const matchesTags = React.useCallback(
@@ -5045,6 +5270,11 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               for (const tag of pin.tags ?? []) counts.set(tag, count(tag) + 1);
             }
           }
+          // Standalone tags belong to the overview only: 「本对话」 counts what this
+          // conversation actually holds, and a name nothing here uses would be noise. The
+          // zero counts are kept so the manager can say "saved, not used yet" instead of
+          // hiding the name the user just created.
+          for (const tag of store.extraTags()) if (!counts.has(tag)) counts.set(tag, 0);
         } else if (sessionId) {
           for (const pin of store.list(sessionId)) {
             for (const tag of pin.tags ?? []) counts.set(tag, count(tag) + 1);
@@ -5348,7 +5578,32 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             h('span', { className: 'tool-icon' }, '⤓'),
             '导出',
           ),
+          // A name can be saved before any passage uses it — that is what makes "seed the
+          // tags, then file the passages" a workable order. Icon plus a short label: the row
+          // does not wrap, so a fourth long button would squeeze the others.
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'tool',
+              title: creating ? '收起新建标签' : '新建一个还没有片段的标签',
+              'aria-expanded': creating ? 'true' : 'false',
+              // Keep the input from blurring on the way to this button: a blur would close
+              // the row and the click would reopen it, which reads as a flicker.
+              onMouseDown: (event) => event.preventDefault(),
+              onClick: () => setCreating((value) => !value),
+            },
+            h('span', { className: 'tool-icon' }, '＋'),
+            '标签',
+          ),
         ),
+        creating
+          ? h(TagCreator, {
+              vocabulary: tagVocabulary(),
+              onCreated: (name) => store.addExtraTag(name),
+              onClose: () => setCreating(false),
+            })
+          : null,
         tags.length > 0
           ? h(
               'div',
@@ -5364,7 +5619,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                       className: 'tag',
                       'data-on': tagFilter.has(tag) ? '' : undefined,
                       title: `筛选：#${tag}（${count} 条）`,
-                      onClick: () => toggleTagFilter(tag),
+                      onClick: () => toggleTagFilter(tag, count),
                     },
                     `#${tag}`,
                   ),
@@ -5397,13 +5652,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               onDelete: (tag) => {
                 const removed =
                   mode === 'all' ? store.removeTagEverywhere(undefined, tag) : sessionId ? store.removeTagEverywhere(sessionId, tag) : 0;
+                // A name created standalone has no pin to strip it from, so it has to be
+                // forgotten here or it would reappear on the very next render.
+                const droppedExtra = store.removeExtraTag(tag);
                 setTagFilter((current) => {
                   if (!current.has(tag)) return current;
                   const next = new Set(current);
                   next.delete(tag);
                   return next;
                 });
-                announce(removed > 0 ? `已删除标签 #${tag}（涉及 ${removed} 条片段）` : `标签 #${tag} 已经不在了`);
+                if (removed > 0) announce(`已删除标签 #${tag}（涉及 ${removed} 条片段）`);
+                else if (droppedExtra) announce(`已删除标签 #${tag}`);
+                else announce(`标签 #${tag} 已经不在了`);
               },
               onToggleFilter: toggleTagFilter,
               activeTags: Object.fromEntries([...tagFilter].map((tag) => [tag, true])),
