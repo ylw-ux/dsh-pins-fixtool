@@ -6,6 +6,29 @@
 
 A Web UI plugin for [DeepSeek Harness](https://github.com/deepseek-ai). What gets lost while reading a long reply is *where was I, and which sentences actually mattered* — select, pin, come back. That is the whole of it.
 
+## What's new: 1.0.6 (2026-11-10)
+
+**This is a hotfix**: it adapts to the official 「引用文本」 (Quote text) selection toolbar added in **DSH 0.2.2**, and fixes "a newly pinned passage shows no emphasis".
+
+**Backward compatible** — users still on an older DSH (before 0.2.2) keep working exactly as before and can upgrade safely. Even if your DSH has no host toolbar yet, this release also fixes a bug, so it is still worth taking.
+
+| Change | What it does |
+|---|---|
+| **Adapted to the host toolbar** | The host's above, this plugin's below; both step aside when the selection is near the top or bottom edge |
+| **Toolbar mode setting** | Settings → Plugins → Pinned passages › Selection toolbar, one of three |
+| **Fixed "no emphasis after pinning"** | Scrolls the new card into view, then pulses; says so when a search or tag filter is hiding it |
+
+**Older DSH (before 0.2.2, no host toolbar) — what each mode does there:**
+
+| Mode you pick | What actually happens |
+|---|---|
+| **Show both** (default) | Only this plugin's bar, as before |
+| **This plugin's bar only** | Same as default — nothing to hide — and nothing breaks |
+| **The host's 「引用文本」 only** | **This plugin's bar disappears** (that build has no host bar). Pinning still works via `Alt+P` and the side panel; switch back to restore it |
+
+> On an older build the settings page states this difference right under the switch, so nobody has to find out by clicking.
+> Rule of thumb: **on an older DSH, keep one of the first two modes.**
+
 ## Install
 
 Requires the Harness Web UI (`dsh web`). One command — it also **selects the bundle into your profile** for you:
@@ -160,6 +183,8 @@ Recalculates after pinning, deleting or re-tagging.
 Verified on: **DSH `0.2.1-rc.5` · Node `24.14.1` · pnpm `12.6.0`** (1.0.3 and earlier were verified on `0.2.0-rc.2`).
 
 **Since DSH `0.2.2`** the host ships its own selection toolbar, 「引用文本」. This plugin is adapted: by default it yields the band above the selection and places itself below it, and the settings can make either one the only one. The host surface is recognised through its public `data-text-interaction-surface` attribute rather than an internal class name — if the host changes that, this plugin simply behaves as if there were no host toolbar and falls back to its old placement.
+
+**Backward compatible**: builds before `0.2.2` work too, with no loss of features. When no host toolbar is found the bar is placed the old way; on an older build the 「host toolbar only」 mode simply hides this plugin's bar (see the table under What's new).
 
 The package declares **no `peerDependencies` and no `engines.dsh`**, deliberately: it imports no Harness package (the browser half only `require`s `react`; the host half is an empty `apply`), and every host interaction is feature-checked and either degrades or reports clearly. Declaring a version range I cannot verify would only block installs.
 

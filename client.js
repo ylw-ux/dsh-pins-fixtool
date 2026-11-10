@@ -6059,6 +6059,11 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         PINS_EVENTS.addEventListener('bar-mode', onChange);
         return () => PINS_EVENTS.removeEventListener('bar-mode', onChange);
       }, []);
+      // Whether this DSH build has the host's own selection toolbar (0.2.2+). That element is
+      // rendered whenever a conversation is on screen — which is the case while settings are
+      // open — so its absence means an older build. The copy below then says what each mode
+      // actually does there, instead of letting the user discover it by clicking.
+      const hostHasBar = document.querySelector('[data-text-interaction-surface]') !== null;
       const refresh = React.useCallback(() => setReading(measureStorage()), []);
       const percent = (share) => `约 ${(share * 100).toFixed(share < 0.1 ? 1 : 0)}%`;
       const barState = reading.allShare >= 1 ? 'is-full' : reading.allShare >= 0.9 ? 'is-warn' : '';
@@ -6088,7 +6093,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         h(
           'p',
           { className: 'hint' },
-          '官方的「引用文本」从 DSH 0.2.2 起提供。选「只用官方」后本插件的浮条不再出现（固定仍可用 Alt+P 和右侧面板）；选「只用我的」会隐藏官方那个按钮，但它的引用渲染照常工作。',
+          hostHasBar
+            ? '官方的「引用文本」从 DSH 0.2.2 起提供。选「只用官方」后本插件的浮条不再出现（固定仍可用 Alt+P 和右侧面板）；选「只用我的」会隐藏官方那个按钮，但它的引用渲染照常工作。'
+            : '当前 DSH 没有官方的「引用文本」浮条（0.2.2 之前）。此时选「只用官方」等于关掉本插件的浮条——固定仍可用 Alt+P 和右侧面板；选「只用我的」与默认效果相同。',
         ),
         h('h3', null, '已用存储'),
         reading.unavailable
