@@ -4742,6 +4742,34 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     const HOVER_SCROLL_QUIET = 150;
 
     /**
+     * Scroll the nearest scrollable ancestor so that `node` sits near its top.
+     *
+     * Used by **both** "put this card under the user's eyes" paths — clicking a composer
+     * chip, and pinning a new passage — because emphasis applied to a card outside the
+     * viewport is emphasis nobody sees. The two paths used to differ: the chip scrolled and
+     * pulsed, the new pin only pulsed, so a passage that landed below the fold looked as if
+     * nothing had happened at all.
+     */
+    function scrollCardIntoView(node) {
+      let scroller = node.parentElement;
+      while (scroller) {
+        if (scroller.scrollHeight - scroller.clientHeight > 8) {
+          const overflowY = window.getComputedStyle(scroller).overflowY;
+          if (overflowY === 'auto' || overflowY === 'scroll') break;
+        }
+        scroller = scroller.parentElement;
+      }
+      if (!scroller) return;
+      const top =
+        scroller.scrollTop + (node.getBoundingClientRect().top - scroller.getBoundingClientRect().top) - 8;
+      try {
+        scroller.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+      } catch {
+        scroller.scrollTop = Math.max(0, top);
+      }
+    }
+
+    /**
      * Build the pin list.
      *
      * The hover behaviour lives here rather than in each card because "one expanded
@@ -5047,25 +5075,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             announce('这条固定片段不在当前列表里（可能被搜索、标签筛选或折叠挡住了）', 'error');
             return;
           }
-          let scroller = node.parentElement;
-          while (scroller) {
-            if (scroller.scrollHeight - scroller.clientHeight > 8) {
-              const overflowY = window.getComputedStyle(scroller).overflowY;
-              if (overflowY === 'auto' || overflowY === 'scroll') break;
-            }
-            scroller = scroller.parentElement;
-          }
-          if (scroller) {
-            const top =
-              scroller.scrollTop +
-              (node.getBoundingClientRect().top - scroller.getBoundingClientRect().top) -
-              8;
-            try {
-              scroller.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
-            } catch {
-              scroller.scrollTop = Math.max(0, top);
-            }
-          }
+          scrollCardIntoView(node);
           node.classList.add('is-pulse');
           window.setTimeout(() => node.classList.remove('is-pulse'), 1600);
         };
@@ -5091,14 +5101,22 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               }
             }
             if (!node) {
-              // Still rendering, or the pin is hidden by a search or tag filter: a card
-              // that is not on screen is not a failure, so this stays quiet.
-              if (tries < 40) {
+              // Still rendering, or hidden by a search / tag filter / a folded group. The
+              // window is generous because this action usually opens the panel, so the card
+              // cannot exist yet. Giving up silently is what made a working pin look like a
+              // broken animation.
+              if (tries < 90) {
                 tries += 1;
                 frame = window.requestAnimationFrame(paint);
+              } else {
+                console.info('[dsh-pins] 新固定的卡片不在列表里（可能被筛选/折叠挡住，或列表停在别的对话）', pinId);
+                announce('刚固定的片段没有出现在当前列表里（可能被搜索、标签筛选或折叠挡住了）', 'info');
               }
               return;
             }
+            // Scroll first, then pulse: emphasis applied outside the viewport is invisible.
+            scrollCardIntoView(node);
+            console.info('[dsh-pins] 新卡片已滚到视口并闪烁', pinId);
             node.classList.add('is-fresh');
             window.clearTimeout(timer);
             timer = window.setTimeout(() => node.classList.remove('is-fresh'), 1300);
