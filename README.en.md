@@ -58,6 +58,9 @@ Select text in the conversation; an action bar appears above the selection:
 - **Click a card's text**: always jumps back to the source, centred on the selected passage
 - `#` / `❞` / `⧉` / `✕` on a card: edit tags / quote into the composer / copy the raw text / unpin
 
+> **DSH 0.2.2 ships its own selection toolbar, 「引用文本」 (Quote text).** Both are shown by default: the host's above the selection, this plugin's below it (pin / tag / quote live on the lower one).
+> To keep only one, go to **Settings → Plugins → Pinned passages › Selection toolbar**.
+
 ### 2. Tags: type a letter and pick from the ones you already have
 
 Type in a card's tag box, or in the bar's tag box, and the existing tags that match appear right below:
@@ -104,9 +107,19 @@ Two shapes, and **both carry their content — neither is a pointer**:
 
 Either way the passage really reaches the model, and never expires afterwards.
 
-### 5. See how much room it takes
+### 5. Settings: the selection toolbar and storage usage
 
-**Settings → Plugins → Pinned passages**:
+**Settings → Plugins → Pinned passages**.
+
+**Selection toolbar** (one of three) — DSH 0.2.2 added its own 「引用文本」, and the two would claim the same spot:
+
+| Option | Effect |
+|---|---|
+| **Show both** (default) | The host's above the selection, this plugin's below it |
+| **This plugin's bar only** | The host's button is hidden; its quote rendering keeps working |
+| **The host's 「引用文本」 only** | This plugin's bar stays out of the way; pinning still works via `Alt+P` and the side panel |
+
+**Storage used** (read-only; the toolbar mode above is the only changeable thing on this page):
 
 | Figure | What it is |
 |---|---|
@@ -114,7 +127,7 @@ Either way the passage really reaches the model, and never expires afterwards.
 | Whole origin | key count, characters, roughly what percentage, with a progress bar |
 | ≥90% | a reminder banner; when full, the page states plainly that new pins will not be saved |
 
-The page is **read-only** — only a "Recount" button — and recalculates after pinning, deleting or re-tagging.
+Recalculates after pinning, deleting or re-tagging.
 
 ### 6. The side panel
 
@@ -145,6 +158,8 @@ The page is **read-only** — only a "Recount" button — and recalculates after
 ## Compatibility
 
 Verified on: **DSH `0.2.1-rc.5` · Node `24.14.1` · pnpm `12.6.0`** (1.0.3 and earlier were verified on `0.2.0-rc.2`).
+
+**Since DSH `0.2.2`** the host ships its own selection toolbar, 「引用文本」. This plugin is adapted: by default it yields the band above the selection and places itself below it, and the settings can make either one the only one. The host surface is recognised through its public `data-text-interaction-surface` attribute rather than an internal class name — if the host changes that, this plugin simply behaves as if there were no host toolbar and falls back to its old placement.
 
 The package declares **no `peerDependencies` and no `engines.dsh`**, deliberately: it imports no Harness package (the browser half only `require`s `react`; the host half is an empty `apply`), and every host interaction is feature-checked and either degrades or reports clearly. Declaring a version range I cannot verify would only block installs.
 

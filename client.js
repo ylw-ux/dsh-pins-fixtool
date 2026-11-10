@@ -63,6 +63,57 @@ window.__ModuleLoader__.load({
     /** A vocabulary, not a dataset: past this the list stops being something one can scan. */
     const MAX_EXTRA_TAGS = 200;
     /**
+     * How the two selection toolbars share the screen.
+     *
+     * DSH 0.2.2 ships its own 「引用文本」 action in a shared selection surface, placed 8px
+     * above the selection — the same band this plugin's bar used to take. `both` stacks them
+     * (ours below, the host's above); the other two modes make one of them the only one.
+     */
+    const BAR_MODE_KEY = 'dsh-pins/bar-mode';
+    const BAR_MODES = ['both', 'pins', 'official'];
+    const BAR_MODE_LABELS = {
+      both: '两个都显示：我的在下方，官方的在上方',
+      pins: '只用固定片段的浮条',
+      official: '只用官方的「引用文本」',
+    };
+    /** Read once at start; `setBarMode` keeps it and the stored value in step. */
+    let barMode = (() => {
+      const raw = readJson(BAR_MODE_KEY, 'both');
+      return BAR_MODES.includes(raw) ? raw : 'both';
+    })();
+
+    /**
+     * Hide the host's selection toolbar when the user asked for ours only.
+     *
+     * `visibility`, never `display`: the host measures its own surface to position it, and a
+     * `display:none` surface measures zero — switching modes mid-session would leave it stuck
+     * wherever it was when it last measured.
+     */
+    function applyBarMode() {
+      const root = document.documentElement;
+      if (root === null || root === undefined) return;
+      if (barMode === 'pins') root.dataset.dshPinsBarMode = 'pins';
+      else delete root.dataset.dshPinsBarMode;
+    }
+
+    /**
+     * Switch toolbar mode, persist it, and tell the open surfaces to re-read it.
+     *
+     * Only the host surface's **visibility** is ever touched. The plugin that draws
+     * 「引用文本」 also registers the UserText quote rule that renders `> ` lines — and this
+     * plugin's own quotes are exactly that — so disabling that plugin would take our quote
+     * presentation down with it. Hiding one button is the honest limit.
+     */
+    function setBarMode(mode) {
+      const next = BAR_MODES.includes(mode) ? mode : 'both';
+      if (next === barMode) return next;
+      barMode = next;
+      writeJson(BAR_MODE_KEY, next);
+      applyBarMode();
+      PINS_EVENTS.dispatchEvent(new CustomEvent('bar-mode', { detail: { mode: next } }));
+      return next;
+    }
+    /**
      * How much of one selection is stored, in characters.
      *
      * 600 → 2000 (2026-11-05). The old figure was a storage cap, not a reading preference:
@@ -2317,6 +2368,21 @@ window.__ModuleLoader__.load({
   transition:border-color 140ms cubic-bezier(0,0,.2,1),box-shadow 140ms cubic-bezier(0,0,.2,1)}
 .dsh-pins-newtag input:focus{border-color:var(--dsw-alias-brand-primary);
   box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent)}
+/* Toolbar mode 「只用固定片段的浮条」: hide the host's own selection toolbar.
+   visibility, not display — the host measures that surface to place it, and a display:none
+   surface measures zero, which would leave it stuck after switching back. */
+html[data-dsh-pins-bar-mode="pins"] [data-text-interaction-surface]{visibility:hidden!important;
+  pointer-events:none!important}
+.dsh-pins-settings .modes{display:flex;flex-direction:column;gap:4px;margin:8px 0}
+.dsh-pins-settings .mode{display:block;width:100%;box-sizing:border-box;padding:6px 9px;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);text-align:left;cursor:pointer;
+  transition:border-color 140ms cubic-bezier(0,0,.2,1)}
+.dsh-pins-settings .mode[data-on]{border-color:var(--dsw-alias-brand-primary);
+  background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-settings .hint{margin:6px 0 0;color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1.7}
 /* ×0 is information, not a problem: dim it instead of colouring it. */
 .dsh-pins-root .tagmgr-count[data-zero]{color:var(--dsw-alias-label-tertiary);opacity:.85}
 .dsh-pins-root .empty{margin:28px 16px;color:var(--dsw-alias-label-secondary);line-height:1.8;
@@ -2802,6 +2868,15 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const actionRef = React.useRef(() => {});
       stateRef.current = state;
 
+      // Which toolbar(s) to show. The setting lives in the settings tab; this reads it and
+      // re-renders on change, so switching takes effect without a page reload.
+      const [mode, setModeState] = React.useState(barMode);
+      React.useEffect(() => {
+        const onChange = () => setModeState(barMode);
+        PINS_EVENTS.addEventListener('bar-mode', onChange);
+        return () => PINS_EVENTS.removeEventListener('bar-mode', onChange);
+      }, []);
+
       // Late-bound so the notice effect below can call `say` without being re-created.
       const sayRef = React.useRef(() => {});
 
@@ -3167,7 +3242,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       return h(
         React.Fragment,
         null,
-        state ? h(Toolbar, { state, onAction, takenTags }) : null,
+        state && mode !== 'official' ? h(Toolbar, { state, onAction, takenTags }) : null,
         h(ReturnPill, { context }),
         notice !== ''
           ? h(
@@ -5978,6 +6053,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     function StorageSettingsTab() {
       const [reading, setReading] = React.useState(() => measureStorage());
       React.useEffect(() => store.subscribe(() => setReading(measureStorage())), []);
+      const [mode, setModeState] = React.useState(barMode);
+      React.useEffect(() => {
+        const onChange = () => setModeState(barMode);
+        PINS_EVENTS.addEventListener('bar-mode', onChange);
+        return () => PINS_EVENTS.removeEventListener('bar-mode', onChange);
+      }, []);
       const refresh = React.useCallback(() => setReading(measureStorage()), []);
       const percent = (share) => `约 ${(share * 100).toFixed(share < 0.1 ? 1 : 0)}%`;
       const barState = reading.allShare >= 1 ? 'is-full' : reading.allShare >= 0.9 ? 'is-warn' : '';
@@ -5985,6 +6066,30 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       return h(
         'div',
         { className: 'dsh-pins-settings', 'data-dsh-pins': '' },
+        h('h3', null, '选区浮条'),
+        h(
+          'div',
+          { className: 'modes' },
+          BAR_MODES.map((id) =>
+            h(
+              'button',
+              {
+                key: id,
+                type: 'button',
+                className: 'mode',
+                'data-on': mode === id ? '' : undefined,
+                'aria-pressed': mode === id ? 'true' : 'false',
+                onClick: () => setModeState(setBarMode(id)),
+              },
+              BAR_MODE_LABELS[id],
+            ),
+          ),
+        ),
+        h(
+          'p',
+          { className: 'hint' },
+          '官方的「引用文本」从 DSH 0.2.2 起提供。选「只用官方」后本插件的浮条不再出现（固定仍可用 Alt+P 和右侧面板）；选「只用我的」会隐藏官方那个按钮，但它的引用渲染照常工作。',
+        ),
         h('h3', null, '已用存储'),
         reading.unavailable
           ? h(
@@ -6186,6 +6291,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         own(registerStyles());
       } catch (error) {
         console.error('[dsh-pins] 样式注入失败', error);
+      }
+
+      // The saved toolbar mode decides one global CSS attribute: on first paint, before any
+      // selection exists. Failure here must not take the plugin down — the mode is a
+      // preference, and `both` is what the absent attribute means.
+      try {
+        applyBarMode();
+        own(() => {
+          delete document.documentElement.dataset.dshPinsBarMode;
+        });
+      } catch (error) {
+        console.error('[dsh-pins] 浮条模式初始化失败', error);
       }
 
       own(startMarkerWatch());
