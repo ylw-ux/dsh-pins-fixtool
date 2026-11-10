@@ -2473,6 +2473,28 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#region floating action bar
 
+    /**
+     * Rect of the host's own selection toolbar, when one is on screen.
+     *
+     * DSH 0.2.2 introduced a shared text-interaction surface (`data-text-interaction-surface`
+     * — a public hook, not a hashed class) that hosts the built-in 「引用文本」 action and is
+     * placed 8px above the selection: the exact band this plugin's bar used to take.
+     * Detecting it lets the bar step out of that band instead of stacking two toolbars over
+     * one passage. Anything unexpected — an older build, a hidden surface, a surface whose
+     * slot rendered nothing — reads as "no host toolbar", and the bar places itself as it
+     * always did.
+     */
+    function hostInteractionBarRect() {
+      const surface = document.querySelector('[data-text-interaction-surface]');
+      if (surface === null) return null;
+      if (surface.getAttribute('aria-hidden') === 'true') return null;
+      if (surface.childElementCount === 0) return null;
+      const box = surface.getBoundingClientRect();
+      if (box.width < 1 || box.height < 1) return null;
+      if (getComputedStyle(surface).visibility === 'hidden') return null;
+      return { top: box.top, bottom: box.bottom, left: box.left, right: box.right };
+    }
+
     function Toolbar({ state, onAction, takenTags }) {
       const [tagging, setTagging] = React.useState(false);
       const [draft, setDraft] = React.useState('');
@@ -2719,16 +2741,30 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       const listHeight =
         suggestRows.length > 0 ? Math.min(suggestRows.length, SUGGEST_ROWS_BAR) * SUGGEST_ROW_HEIGHT + 6 : 0;
       const barHeight = TOOLBAR_HEIGHT + (tagging ? 30 : 0) + listHeight;
-      const above = rect ? rect.top - barHeight - 8 : 0;
-      // This used to be the *distance* to the bottom (innerHeight - rect.bottom + 8) and was
-      // then used as a top coordinate: a selection near the top threw the bar into the
-      // middle of the screen. The coordinate under the selection is what is wanted.
-      const below = rect ? rect.bottom + 8 : 8;
-      const top = rect
-        ? above >= 8
-          ? above
-          : Math.max(8, Math.min(below, window.innerHeight - barHeight - 8))
-        : 8;
+      /**
+       * Where the bar goes: **below the selection** first.
+       *
+       * DSH 0.2.2 added its own selection toolbar (「引用文本」) through the shared
+       * text-interaction surface, and it claims the 8px band above the selection — the spot
+       * this bar used to take. Going below keeps both reachable. When the host had to fall
+       * back below too (a selection near the top of the window), ours slips under it rather
+       * than covering it. Above stays as the last resort for a selection pinned to the
+       * bottom edge, where below would be off-screen.
+       */
+      const placeBar = () => {
+        const gap = 8;
+        const floor = window.innerHeight - gap;
+        const below = rect.bottom + gap;
+        const above = rect.top - gap - barHeight;
+        const host = hostInteractionBarRect();
+        const taken = (top) => host !== null && top < host.bottom + gap && top + barHeight > host.top - gap;
+        if (below + barHeight <= floor && !taken(below)) return below;
+        if (above >= gap && !taken(above)) return above;
+        if (host !== null && host.bottom + gap + barHeight <= floor) return host.bottom + gap;
+        // Every band is taken: keep the bar on screen rather than half outside it.
+        return Math.max(gap, Math.min(below, floor - barHeight));
+      };
+      const top = rect ? placeBar() : 8;
       const left = rect ? Math.max(8, Math.min(rect.left + rect.width / 2 - TOOLBAR_WIDTH / 2, window.innerWidth - TOOLBAR_WIDTH - 8)) : 8;
 
       return h(
