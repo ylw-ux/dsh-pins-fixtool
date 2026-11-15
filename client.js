@@ -1258,6 +1258,71 @@ window.__ModuleLoader__.load({
       return undefined;
     }
 
+    /**
+     * Find a filed passage that a new selection would overlap.
+     *
+     * Overlapping passages are refused rather than merged. Two markers that intersect cannot
+     * be told apart in the transcript — a click would have to guess which passage the user
+     * means — and the same words filed twice both clutter the panel and waste storage.
+     *
+     * Intervals are compared in the whitespace-collapsed text of the same node, the space both
+     * `offset` values were measured in. **Touching ends are not an overlap**: two passages
+     * that meet exactly are two passages. An anchor whose offset could not be read (`-1`)
+     * never counts as overlapping — refusing a passage the plugin cannot even place would be
+     * worse than letting a duplicate through.
+     *
+     * @returns the pin that blocks the selection, or null.
+     */
+    function findOverlappingPin(pins, anchor) {
+      const row = String(anchor?.flowKey ?? '');
+      const start = Number(anchor?.offset);
+      const length = String(anchor?.quote ?? '').length;
+      if (row === '' || !Number.isFinite(start) || start < 0 || length <= 0) return null;
+      const end = start + length;
+      const node = String(anchor?.node ?? row);
+      for (const pin of pins ?? []) {
+        const other = pin?.anchor;
+        if (!other || String(other.flowKey ?? '') !== row) continue;
+        if (String(other.node ?? other.flowKey ?? '') !== node) continue;
+        const otherStart = Number(other.offset);
+        const otherLength = String(other.quote ?? '').length;
+        if (!Number.isFinite(otherStart) || otherStart < 0 || otherLength <= 0) continue;
+        if (start < otherStart + otherLength && otherStart < end) return pin;
+      }
+      return null;
+    }
+
+    /**
+     * Count passages that still overlap another passage.
+     *
+     * Only records filed before the rule existed can reach this: new writes are refused.
+     * Reported in settings and never rewritten — deleting someone's passages to tidy up a rule
+     * those passages predate would be exactly the data loss this project keeps refusing.
+     */
+    function countOverlappingPins(pins) {
+      const byNode = new Map();
+      for (const pin of pins ?? []) {
+        const anchor = pin?.anchor;
+        const start = Number(anchor?.offset);
+        const length = String(anchor?.quote ?? '').length;
+        if (!Number.isFinite(start) || start < 0 || length <= 0) continue;
+        const key = `${String(anchor.flowKey ?? '')}\u0000${String(anchor.node ?? anchor.flowKey ?? '')}`;
+        const rows = byNode.get(key);
+        if (rows) rows.push({ start, end: start + length });
+        else byNode.set(key, [{ start, end: start + length }]);
+      }
+      let count = 0;
+      for (const rows of byNode.values()) {
+        rows.sort((left, right) => left.start - right.start);
+        let reach = -1;
+        for (const row of rows) {
+          if (row.start < reach) count += 1;
+          if (row.end > reach) reach = row.end;
+        }
+      }
+      return count;
+    }
+
     //#endregion
 
     //#region jumping back
@@ -3132,6 +3197,19 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               // passage, and treating it as the same one made a new selection attach its
               // tag to the previous pin. Only an exact passage matches.
               const existing = findExistingPin(store, target, current.anchor);
+              if (!existing) {
+                // Overlapping a filed passage is refused, not merged: two markers that
+                // intersect cannot be told apart in the transcript, and the same words twice
+                // would be filed twice. The blocking passage is revealed instead, so "no"
+                // still answers "where is the one I already have?".
+                const clash = findOverlappingPin(store.list(target), { ...current.anchor, sessionId: String(target) });
+                if (clash) {
+                  dismissBar('这段和已固定的片段重叠');
+                  say('这段和已固定的片段重叠，已在右侧标出那一条', 'info');
+                  PINS_EVENTS.dispatchEvent(new CustomEvent('chip-reveal', { detail: { pinId: clash.id } }));
+                  return;
+                }
+              }
               record =
                 existing ??
                 store.add(target, {
@@ -5157,6 +5235,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               // its own pin instead of lending its tag to the previous one.
               const existing = findExistingPin(store, sessionId, { ...(detail.anchor ?? {}), sessionId: String(sessionId) });
               if (!existing) {
+                const clash = findOverlappingPin(store.list(sessionId), { ...(detail.anchor ?? {}), sessionId: String(sessionId) });
+                if (clash) {
+                  PINS_EVENTS.dispatchEvent(new CustomEvent('chip-reveal', { detail: { pinId: clash.id } }));
+                  reply({
+                    ok: false,
+                    reason: 'overlap',
+                    message: '这段和已固定的片段重叠（已在右侧标出那一条）：先取消那一条，再固定这段',
+                  });
+                  return;
+                }
+              }
+              if (!existing) {
                 const record = store.add(
                   sessionId,
                   {
@@ -6133,6 +6223,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // open — so its absence means an older build. The copy below then says what each mode
       // actually does there, instead of letting the user discover it by clicking.
       const hostHasBar = document.querySelector('[data-text-interaction-surface]') !== null;
+      // Passages filed before the no-overlap rule can still overlap each other. Counted so the
+      // user can tidy them up; nothing here ever edits them.
+      const overlapCount = React.useMemo(() => {
+        const all = [];
+        for (const [, entry] of store.sessions()) for (const pin of entry.pins ?? []) all.push(pin);
+        return countOverlappingPins(all);
+      }, [reading]);
       const [shortcut, setShortcutState] = React.useState(shortcutOn);
       React.useEffect(() => {
         const onChange = () => setShortcutState(shortcutOn);
@@ -6236,6 +6333,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               reading.allShare >= 1
                 ? '本站存储已满：新的固定不会保存。删掉一些片段，或清理这个站点的数据后重试。'
                 : '本站存储已用约 90% 以上：再存内容可能失败，建议先清理。',
+            )
+          : null,
+        overlapCount > 0
+          ? h(
+              'div',
+              { className: 'warn', role: 'status' },
+              `有 ${overlapCount} 条旧片段互相重叠。新固定不会再产生重叠；这些旧记录不会被自动改动，可以在「全部」视图里手动整理。`,
             )
           : null,
         h('div', { className: 'row' }, h('button', { type: 'button', className: 'mini', onClick: refresh }, '重新统计')),
