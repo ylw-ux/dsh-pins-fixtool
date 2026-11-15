@@ -1521,16 +1521,17 @@ window.__ModuleLoader__.load({
      *   3. the browser-like packed view, which is what existing pins were resolved
      *      against.
      *
-     * `widen` grows a short quote to the surrounding word boundaries so a two-word
-     * pin is still findable by eye. Only ASCII word fragments are absorbed: widening
-     * across a space is a word-boundary rule, and in Chinese the nearest space is
-     * layout, not a word edge (S15). The widening is re-verified so it can never
-     * drift onto neighbouring words.
+     * The returned range is *exactly* the stored passage. Short quotes used to be grown to
+     * the surrounding word boundaries so a two-word pin stayed findable by eye; that widening
+     * was removed because the painted range now has to equal the stored one. Overlap refusal,
+     * the hover target and click-to-reveal all compare these intervals, and a shading wider
+     * than the record made "which passage is this?" unanswerable at the edges. The old S15
+     * complaint — pinning 「前面各节」 marked 「与前面各节」 — disappeared with the widening.
      *
      * @returns `{ range, verdict }` — `'exact'` for a quote match, `'message'` when
      *   the passage could not be found (the caller then highlights the message).
      */
-    function locateQuote(row, pin, widen) {
+    function locateQuote(row, pin) {
       try {
         const index = cachedIndex(row);
         const anchor = pin?.anchor ?? {};
@@ -1582,31 +1583,8 @@ window.__ModuleLoader__.load({
           return typeof mapped === 'number' ? mapped : position;
         };
 
-        let start = best.at;
-        let length = best.length;
-        if (widen && length < 24) {
-          const text = view ?? index.raw;
-          // Word-widening assumes a space is a word boundary. That holds for English and
-          // fails for Chinese, where the nearest space is usually layout — after "5.5 ",
-          // after a dash, or between a CJK run and an ASCII word — rather than a word edge.
-          // Pinning 「前面各节」 inside "5.5 与前面各节的关系。" therefore marked
-          // 「与前面各节」: one character stolen from the neighbouring word. Only absorb
-          // ASCII word characters, so `exam` still grows to `example` while a CJK selection
-          // keeps exactly the characters the user picked. The pass below still re-verifies
-          // the resolved range, so a wrong widening degrades to a message mark, never a
-          // misplaced one.
-          const wordChar = /[A-Za-z0-9_'’-]/;
-          const absorbedWords = (slice) => slice !== '' && [...slice].every((ch) => wordChar.test(ch));
-          const left = text.lastIndexOf(' ', start);
-          if (left >= 0 && start - left < 8 && absorbedWords(text.slice(left + 1, start))) {
-            length += start - left - 1;
-            start = left + 1;
-          }
-          const right = text.indexOf(' ', start + length);
-          if (right >= 0 && right - (start + length) < 8 && absorbedWords(text.slice(start + length, right))) {
-            length = right - start;
-          }
-        }
+        const start = best.at;
+        const length = best.length;
 
         const range = best.mode === 'raw'
           ? index.rangeForRaw(start, start + length)
@@ -1692,7 +1670,7 @@ window.__ModuleLoader__.load({
               reportMarker(pin.id, 'pending');
               continue;
             }
-            const located = locateQuote(row, pin, true);
+            const located = locateQuote(row, pin);
             if (located.range) {
               ranges.push(located.range);
               reportMarker(pin.id, 'ok');
@@ -2090,7 +2068,7 @@ window.__ModuleLoader__.load({
             frames += 1;
             const late = resolveRow(pin).row;
             if (late) {
-              const lateLocated = locateQuote(late, pin, false);
+              const lateLocated = locateQuote(late, pin);
               scrollToRange(lateLocated.range) || scrollToRow(late);
               return;
             }
@@ -2101,7 +2079,7 @@ window.__ModuleLoader__.load({
         return 'missing';
       }
 
-      const located = locateQuote(row, pin, false);
+      const located = locateQuote(row, pin);
 
       if (!(located.range && scrollToRange(located.range))) scrollToRow(row);
       row.setAttribute('data-dsh-pins-flash', '');
