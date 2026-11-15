@@ -1481,7 +1481,7 @@ window.__ModuleLoader__.load({
      * Only the Session on screen is marked, so switching Sessions never claims
      * pins that belong elsewhere.
      */
-    const markerState = { sessionId: null, refreshTimer: null, refreshSoon: false, observer: null, indexCache: new WeakMap(), applying: false };
+    const markerState = { sessionId: null, refreshTimer: null, refreshSoon: false, observer: null, indexCache: new WeakMap(), applying: false, ranges: new Map() };
 
     /** Per-row text index, reused until the row's DOM changes (the observer clears it). */
     function cachedIndex(row) {
@@ -1656,6 +1656,8 @@ window.__ModuleLoader__.load({
         const canUseHighlight = Boolean(registry) && typeof globalThis.Highlight === 'function';
 
         const ranges = [];
+        // Geometry for the pointer path: pin id -> live Range, rebuilt by every pass.
+        markerState.ranges.clear();
         const seen = new Set();
         if (sessionId) {
           const rows = markedRows();
@@ -1673,6 +1675,7 @@ window.__ModuleLoader__.load({
             const located = locateQuote(row, pin);
             if (located.range) {
               ranges.push(located.range);
+              markerState.ranges.set(pin.id, located.range);
               reportMarker(pin.id, 'ok');
             } else {
               reportMarker(pin.id, 'miss');
@@ -1744,7 +1747,230 @@ window.__ModuleLoader__.load({
       scheduleMarkers(false);
     }
 
+    //#region pin hover
+
+    /** Wait this long over a passage before its action bar appears. */
+    const PIN_HOVER_DWELL = 120;
+    /** Keep it this long after the pointer leaves, so the bar can be reached. */
+    const PIN_HOVER_GRACE = 160;
+
+    const pinHoverState = { pinId: null, x: 0, y: 0, dwellTimer: 0, graceTimer: 0, frame: 0, lastEvent: null, down: null };
+
+    /**
+     * The text position under a viewport point, or null.
+     *
+     * Caret resolution rather than rectangle maths: `::highlight` paints glyphs, so a
+     * rectangle around a range also covers the blank parts of a table cell or the end of a
+     * justified line. Asking the document "which character is under the pointer?" answers the
+     * question the user is actually asking, and it is what keeps the hover bar off empty
+     * space inside a pinned area.
+     */
+    function caretPoint(x, y) {
+      try {
+        if (typeof document.caretPositionFromPoint === 'function') {
+          const position = document.caretPositionFromPoint(x, y);
+          if (!position || !position.offsetNode) return null;
+          return { node: position.offsetNode, offset: position.offset };
+        }
+        if (typeof document.caretRangeFromPoint === 'function') {
+          const range = document.caretRangeFromPoint(x, y);
+          if (!range) return null;
+          return { node: range.startContainer, offset: range.startOffset };
+        }
+      } catch {
+        /* a point outside the viewport throws in some engines */
+      }
+      return null;
+    }
+
+    /**
+     * The pin whose passage contains a viewport point, or null.
+     *
+     * Only passages that were located exactly take part: a pin marked as a whole message
+     * cannot answer "where in the message", so it stays out of the pointer path.
+     */
+    function pinAtPoint(x, y) {
+      const point = caretPoint(x, y);
+      if (!point) return null;
+      let boundary = null;
+      for (const [pinId, range] of markerState.ranges) {
+        let side;
+        try {
+          side = range.comparePoint(point.node, point.offset);
+        } catch {
+          continue;
+        }
+        if (side !== 0) continue;
+        // A point exactly on the start or end boundary also belongs to the neighbouring
+        // passage. A point strictly inside wins; a boundary-only match is kept as a fallback
+        // so the first and last character of a passage still hover as that passage.
+        const atStart = range.startContainer === point.node && range.startOffset === point.offset;
+        const atEnd = range.endContainer === point.node && range.endOffset === point.offset;
+        if (!atStart && !atEnd) return pinId;
+        if (boundary === null) boundary = pinId;
+      }
+      return boundary;
+    }
+
+    /**
+     * Emphasise the hovered passage with its own highlight entry.
+     *
+     * A separate registry name is the only way to give one passage a different colour: the
+     * shared `dsh-pins-mark` entry paints every pin together, so it cannot say "this one".
+     */
+    function paintHoverHighlight(pinId) {
+      const registry = globalThis.CSS?.highlights;
+      if (!registry) return;
+      const range = pinId === null ? null : markerState.ranges.get(pinId) ?? null;
+      try {
+        if (range && typeof globalThis.Highlight === 'function') registry.set('dsh-pins-focus', new globalThis.Highlight(range));
+        else registry.delete('dsh-pins-focus');
+      } catch {
+        /* an unsupported Highlight constructor must not take the pointer path down */
+      }
+    }
+
+    /** Where the two edge bars go for one passage, in viewport coordinates. */
+    function hoverGeometry(pinId) {
+      const range = markerState.ranges.get(pinId);
+      if (!range) return null;
+      let rects = [];
+      try {
+        rects = [...range.getClientRects()].filter((rect) => rect.width > 0 && rect.height > 0);
+      } catch {
+        return null;
+      }
+      if (rects.length === 0) return null;
+      const first = rects[0];
+      const last = rects[rects.length - 1];
+      return {
+        marks: [
+          { x: first.left, y: first.top, height: first.height },
+          { x: last.right, y: last.top, height: last.height },
+        ],
+      };
+    }
+
+    /** Tell the hover layer what to draw, or that nothing is hovered. */
+    function publishPinHover(pinId, x, y) {
+      const geometry = pinId === null ? null : hoverGeometry(pinId);
+      PINS_EVENTS.dispatchEvent(
+        new CustomEvent('pin-hover', {
+          detail:
+            pinId === null || geometry === null
+              ? null
+              : { pinId, sessionId: markerState.sessionId, x, y, marks: geometry.marks },
+        }),
+      );
+    }
+
+    function clearPinHover() {
+      window.clearTimeout(pinHoverState.dwellTimer);
+      window.clearTimeout(pinHoverState.graceTimer);
+      pinHoverState.dwellTimer = 0;
+      pinHoverState.graceTimer = 0;
+      if (pinHoverState.pinId === null) return;
+      pinHoverState.pinId = null;
+      paintHoverHighlight(null);
+      publishPinHover(null, 0, 0);
+    }
+
+    /**
+     * Follow the pointer over painted passages.
+     *
+     * The bar appears after a short dwell and survives a short grace period — the same shape
+     * the cards use. Crossing a paragraph on the way somewhere else must not flash a bar, and
+     * moving from the text onto the bar must not dismiss it. A click (no drag) reveals the
+     * passage's card in the panel; a drag stays a text selection.
+     */
+    function startPinHover() {
+      const doc = document;
+      const overOwnUi = (target) => Boolean(target?.closest?.('[data-dsh-pins],.dsh-pins-bar'));
+
+      const run = () => {
+        pinHoverState.frame = 0;
+        const event = pinHoverState.lastEvent;
+        if (!event) return;
+        if (markerState.ranges.size === 0) {
+          clearPinHover();
+          return;
+        }
+        // The pointer is on the bar itself: keep the bar open, or it would vanish the moment
+        // the user reaches for it.
+        if (overOwnUi(event.target)) return;
+        const selection = doc.getSelection();
+        if (selection && !selection.isCollapsed) {
+          clearPinHover();
+          return;
+        }
+        const pinId = pinAtPoint(event.clientX, event.clientY);
+        if (pinId === null) {
+          if (pinHoverState.pinId !== null && pinHoverState.graceTimer === 0) {
+            pinHoverState.graceTimer = window.setTimeout(() => {
+              pinHoverState.graceTimer = 0;
+              clearPinHover();
+            }, PIN_HOVER_GRACE);
+          }
+          return;
+        }
+        window.clearTimeout(pinHoverState.graceTimer);
+        pinHoverState.graceTimer = 0;
+        if (pinId === pinHoverState.pinId) return;
+        window.clearTimeout(pinHoverState.dwellTimer);
+        const x = event.clientX;
+        const y = event.clientY;
+        pinHoverState.dwellTimer = window.setTimeout(() => {
+          pinHoverState.dwellTimer = 0;
+          pinHoverState.pinId = pinId;
+          pinHoverState.x = x;
+          pinHoverState.y = y;
+          paintHoverHighlight(pinId);
+          publishPinHover(pinId, x, y);
+        }, PIN_HOVER_DWELL);
+      };
+
+      const onMove = (event) => {
+        pinHoverState.lastEvent = event;
+        if (pinHoverState.frame !== 0) return;
+        pinHoverState.frame = window.requestAnimationFrame(run);
+      };
+      const onScroll = () => clearPinHover();
+      const onDown = (event) => {
+        pinHoverState.down = { x: event.clientX, y: event.clientY, target: event.target };
+      };
+      const onUp = (event) => {
+        const start = pinHoverState.down;
+        pinHoverState.down = null;
+        if (!start) return;
+        // A drag is a selection, not a click: only a still pointer reveals the card.
+        if (Math.abs(event.clientX - start.x) > 4 || Math.abs(event.clientY - start.y) > 4) return;
+        if (overOwnUi(event.target)) return;
+        if (event.target?.closest?.('a,button,input,textarea,select')) return;
+        const selection = doc.getSelection();
+        if (selection && !selection.isCollapsed) return;
+        const pinId = pinAtPoint(event.clientX, event.clientY);
+        if (pinId !== null) PINS_EVENTS.dispatchEvent(new CustomEvent('chip-reveal', { detail: { pinId } }));
+      };
+
+      doc.addEventListener('mousemove', onMove, { passive: true });
+      doc.addEventListener('scroll', onScroll, true);
+      doc.addEventListener('pointerdown', onDown, true);
+      doc.addEventListener('pointerup', onUp, true);
+      return () => {
+        doc.removeEventListener('mousemove', onMove, { passive: true });
+        doc.removeEventListener('scroll', onScroll, true);
+        doc.removeEventListener('pointerdown', onDown, true);
+        doc.removeEventListener('pointerup', onUp, true);
+        window.cancelAnimationFrame(pinHoverState.frame);
+        clearPinHover();
+        paintHoverHighlight(null);
+      };
+    }
+
+    //#endregion
+
     function startMarkerWatch() {
+
       try {
         markerState.observer = new MutationObserver((records) => {
           // Our own `<mark>` wrappers are mutations too. Without this pass they would
@@ -2549,6 +2775,32 @@ html[data-dsh-pins-bar-mode="pins"] [data-text-interaction-surface]{visibility:h
 ::highlight(dsh-pins-flash){background-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 40%,transparent)}
 
 /* The durable mark on every pinned passage (jump lands on the same colour). */
+/* The action bar for a passage under the pointer. Same button metrics as the selection bar, so
+   the two layers read as one control whose contents change with the situation. */
+.dsh-pins-hoverbar{position:fixed;z-index:2147483000;display:inline-flex;flex-flow:row wrap;
+  align-items:center;gap:4px;padding:4px;max-width:min(320px,90vw);
+  border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-overlay);box-shadow:var(--dsw-elevation-soft)}
+.dsh-pins-hoverbar button{display:inline-flex;align-items:center;height:26px;padding:0 9px;
+  border:none;border-radius:var(--dsw-radius-sm);background:transparent;
+  color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);cursor:pointer}
+.dsh-pins-hoverbar button:hover{background:var(--dsw-alias-interactive-bg-hover);
+  color:var(--dsw-alias-label-primary)}
+.dsh-pins-hoverbar .sep{width:1px;height:16px;margin:0 3px;background:var(--dsw-alias-border-l2);flex:none}
+.dsh-pins-hoverbar input{width:200px;height:26px;padding:0 8px;border:1px solid var(--dsw-alias-border-l2);
+  border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-base);
+  color:var(--dsw-alias-label-primary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);outline:none}
+.dsh-pins-hoverbar input:focus{border-color:var(--dsw-alias-brand-primary)}
+.dsh-pins-hoverbar .dsh-pins-suggest{flex:1 0 100%;margin-top:2px}
+/* The hovered passage gets its own entry so it can read as the one under the pointer while
+   its neighbours stay in the shared colour. Both colours come from tokens, so light and dark
+   themes decide for themselves. */
+::highlight(dsh-pins-focus){background-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 34%,transparent)}
+.dsh-pins-hover-edge{position:fixed;width:2px;border-radius:1px;pointer-events:none;z-index:2147483000;
+  background:var(--dsw-alias-state-business-primary);
+  box-shadow:0 0 4px color-mix(in srgb,var(--dsw-alias-state-business-primary) 55%,transparent)}
 ::highlight(dsh-pins-mark){background-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 22%,transparent);
   text-decoration:underline;text-decoration-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 60%,transparent);
   text-decoration-thickness:1px;text-underline-offset:3px}
@@ -2943,7 +3195,198 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * misses keyboard selection. The bar's own `mousedown` is prevented so
      * pressing it never clears the selection it acts on.
      */
+    /**
+     * The action bar for a passage under the pointer.
+     *
+     * Lives in the root overlay rather than in the transcript: a `::highlight` region has no
+     * element to attach a handler to, so this bar can only be a layer the plugin owns. It is
+     * positioned at the point where the pointer entered the passage — there is no selection
+     * here, the passage was filed earlier and the user is merely pointing at it.
+     */
+    function PinHoverBar({ context, showPanel, say }) {
+      const [hover, setHover] = React.useState(null);
+      const [tagging, setTagging] = React.useState(false);
+      const [draft, setDraft] = React.useState('');
+      const [active, setActive] = React.useState(-1);
+      const [moved, setMoved] = React.useState(false);
+      const [closed, setClosed] = React.useState(false);
+      const [composing, setComposing] = React.useState(false);
+      const [frozen, setFrozen] = React.useState([]);
+
+      React.useEffect(() => {
+        const onHover = (event) => {
+          setHover(event.detail ?? null);
+          // The bar is about one passage at a time: a new target starts a new conversation.
+          setTagging(false);
+          setDraft('');
+          setActive(-1);
+          setMoved(false);
+          setClosed(false);
+        };
+        PINS_EVENTS.addEventListener('pin-hover', onHover);
+        return () => PINS_EVENTS.removeEventListener('pin-hover', onHover);
+      }, []);
+
+      const pin = React.useMemo(() => {
+        if (!hover) return null;
+        return store.list(hover.sessionId).find((each) => each.id === hover.pinId) ?? null;
+      }, [hover]);
+
+      const taken = new Set(pin?.tags ?? []);
+      const filtered = tagging ? suggestTags(tagVocabulary(), draft, taken) : [];
+      const rows = closed ? [] : composing ? frozen : filtered;
+
+      if (!hover || !pin) return null;
+
+      const sessionId = hover.sessionId;
+      const unpin = () => {
+        store.remove(sessionId, pin.id);
+        scheduleMarkers(false);
+        // Drop the focus highlight with the record: a stale Range would keep painting a
+        // passage that no longer exists until the pointer happened to move again.
+        clearPinHover();
+        say('已取消固定');
+      };
+      const quote = () => {
+        const anchor = { ...pin.anchor, sessionId: String(sessionId) };
+        const origin = pinOrigin(pin, readSessionTitle(context, sessionId));
+        void requestQuote(anchor, pin.text ?? '', origin, false, undefined, showPanel).then((outcome) => {
+          if (outcome.ok) say('把引用放进输入框');
+          else say(`引用失败：${outcome.message ?? outcome.reason ?? '未知原因'}`, 'error');
+        });
+      };
+      const copy = () => {
+        const text = pin.text ?? '';
+        let written = null;
+        try {
+          written = navigator.clipboard?.writeText?.(text) ?? null;
+        } catch {
+          written = null;
+        }
+        if (written && typeof written.then === 'function') {
+          // Report the write only after it resolved: announcing a copy that never happened is
+          // the exact lie this plugin spent a release removing.
+          written.then(
+            () => say('已复制这段文字'),
+            () => say('复制失败：浏览器拒绝了剪贴板', 'error'),
+          );
+        } else {
+          say('这个浏览器不提供剪贴板，没能复制', 'error');
+        }
+      };
+      const addTag = (picked) => {
+        const name = normalizeTag(picked === undefined ? draft : picked);
+        if (name === '') {
+          say('标签名不能只有 # 或空格', 'info');
+          return;
+        }
+        const added = store.addTag(sessionId, pin.id, name);
+        setDraft('');
+        setActive(-1);
+        setMoved(false);
+        setClosed(false);
+        if (added === false) say(`已经有 #${name} 这个标签了`);
+        else say(`已给这段加上 #${name}`);
+      };
+
+      const marks = Array.isArray(hover.marks) ? hover.marks : [];
+      const estimated = tagging ? 240 : 250;
+      const left = Math.max(8, Math.min(hover.x + 12, window.innerWidth - estimated - 8));
+      const top = hover.y - 46 < 8 ? hover.y + 20 : hover.y - 46;
+
+      return h(
+        React.Fragment,
+        null,
+        marks.map((mark, index) =>
+          h('div', {
+            key: `dsh-pins-edge-${index}`,
+            className: 'dsh-pins-hover-edge',
+            style: {
+              left: `${Math.round(mark.x - 1)}px`,
+              top: `${Math.round(mark.y)}px`,
+              height: `${Math.round(mark.height)}px`,
+            },
+          }),
+        ),
+        h(
+          'div',
+          {
+            className: 'dsh-pins-hoverbar',
+            'data-dsh-pins': '',
+            style: { left: `${Math.round(left)}px`, top: `${Math.round(top)}px` },
+          },
+          tagging
+            ? [
+                h('input', {
+                  key: 'tag-input',
+                  autoFocus: true,
+                  value: draft,
+                  placeholder: '标签，回车',
+                  role: 'combobox',
+                  'aria-autocomplete': 'list',
+                  'aria-expanded': rows.length > 0 ? 'true' : 'false',
+                  onChange: (event) => {
+                    setDraft(event.target.value);
+                    setActive(-1);
+                    setMoved(false);
+                    setClosed(false);
+                    if (event.nativeEvent?.isComposing !== true) setComposing(false);
+                  },
+                  onCompositionStart: () => {
+                    setComposing(true);
+                    setFrozen(rows);
+                  },
+                  onCompositionEnd: () => setComposing(false),
+                  onKeyDown: (event) =>
+                    tagKeyDown(event, {
+                      rows,
+                      active,
+                      moved,
+                      listClosed: closed,
+                      onActive: setActive,
+                      onMoved: setMoved,
+                      onCloseList: setClosed,
+                      onSubmit: addTag,
+                      onEscape: () => {
+                        setTagging(false);
+                        setDraft('');
+                      },
+                    }),
+                }),
+                h('button', {
+                  key: 'tag-done',
+                  type: 'button',
+                  title: '收起标签输入',
+                  onClick: () => {
+                    setTagging(false);
+                    setDraft('');
+                  },
+                }, '完成'),
+              ]
+            : [
+                h('button', { key: 'unpin', type: 'button', title: '取消固定这一段', onClick: unpin }, '取消固定'),
+                h('span', { key: 'sep1', className: 'sep' }),
+                h('button', { key: 'quote', type: 'button', title: '把引用放进输入框', onClick: quote }, '引用'),
+                h('button', { key: 'tag', type: 'button', title: '给这段加标签', onClick: () => setTagging(true) }, '标签'),
+                h('span', { key: 'sep2', className: 'sep' }),
+                h('button', { key: 'copy', type: 'button', title: '复制这段文字', onClick: copy }, '复制'),
+              ],
+          tagging
+            ? h(TagSuggest, {
+                idPrefix: 'dsh-pins-hover-suggest',
+                rows,
+                active,
+                maxRows: SUGGEST_ROWS_BAR,
+                onPick: addTag,
+                onHover: setActive,
+              })
+            : null,
+        ),
+      );
+    }
+
     function FloatingActions({ context }) {
+
       const [state, setState] = React.useState(null);
       const [notice, setNotice] = React.useState('');
       const [noticeIsError, setNoticeIsError] = React.useState(false);
@@ -3340,6 +3783,10 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         null,
         state && mode !== 'official' ? h(Toolbar, { state, onAction, takenTags }) : null,
         h(ReturnPill, { context }),
+        // The pointer path shares this overlay with the selection bar: both answer "what can
+        // I do with this text", and splitting them across layers would double the dismissal
+        // logic for no gain.
+        h(PinHoverBar, { context, showPanel, say }),
         notice !== ''
           ? h(
               'div',
@@ -6481,6 +6928,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       }
 
       own(startMarkerWatch());
+      own(startPinHover());
 
       let slots = null;
       try {
