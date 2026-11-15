@@ -76,7 +76,7 @@ Select text in the conversation; an action bar appears above the selection:
 | **Quote** (引用) | Only puts the quote into the composer |
 | **Copy** (复制) | Only copies the raw text |
 
-- `Alt` + `P`: pin / unpin the current selection
+- `Alt` + `P`: pin / unpin the current selection (can be turned off in settings)
 - **Hover a card**: it expands in place (capped at `min(60cqh, 420px)`) and scrolls internally
 - **Click a card's text**: always jumps back to the source, centred on the selected passage
 - `#` / `❞` / `⧉` / `✕` on a card: edit tags / quote into the composer / copy the raw text / unpin
@@ -142,7 +142,9 @@ Either way the passage really reaches the model, and never expires afterwards.
 | **This plugin's bar only** | The host's button is hidden; its quote rendering keeps working |
 | **The host's 「引用文本」 only** | This plugin's bar stays out of the way; pinning still works via `Alt+P` and the side panel |
 
-**Storage used** (read-only; the toolbar mode above is the only changeable thing on this page):
+**Keyboard shortcut**: `Alt + P` pins / unpins; turn it off here if it clashes with another extension.
+
+**Storage used** (read-only):
 
 | Figure | What it is |
 |---|---|
