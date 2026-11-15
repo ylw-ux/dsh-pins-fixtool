@@ -138,9 +138,9 @@ Either way the passage really reaches the model, and never expires afterwards.
 
 | Option | Effect |
 |---|---|
-| **Show both** (default) | The host's above the selection, this plugin's below it |
-| **This plugin's bar only** | The host's button is hidden; its quote rendering keeps working |
-| **The host's 「引用文本」 only** | This plugin's bar stays out of the way; pinning still works via `Alt+P` and the side panel |
+| **Show both** (「两个都显示」, default) | The host's above the selection, this plugin's below it |
+| **This plugin's bar only** (「只用我的」) | The host's button is hidden; its quote rendering keeps working |
+| **The host's 「引用文本」 only** (「只用官方」) | This plugin's bar stays out of the way; pinning still works via `Alt+P` and the side panel |
 
 **Keyboard shortcut**: `Alt + P` pins / unpins; turn it off here if it clashes with another extension.
 
