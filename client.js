@@ -71,10 +71,16 @@ window.__ModuleLoader__.load({
      */
     const BAR_MODE_KEY = 'dsh-pins/bar-mode';
     const BAR_MODES = ['both', 'pins', 'official'];
+    /** Short button labels; the trade-offs live in the per-mode tooltips. */
     const BAR_MODE_LABELS = {
-      both: '两个都显示：我的在下方，官方的在上方',
-      pins: '只用固定片段的浮条',
-      official: '只用官方的「引用文本」',
+      both: '两个都显示',
+      pins: '只用我的',
+      official: '只用官方',
+    };
+    const BAR_MODE_HINTS = {
+      both: '官方在上、本插件在下，两条都能点。',
+      pins: '隐藏官方的「引用文本」按钮；它的引用渲染照常工作。',
+      official: '本插件浮条不再出现；固定仍可用 Alt+P 和右侧面板。',
     };
     /** Read once at start; `setBarMode` keeps it and the stored value in step. */
     let barMode = (() => {
@@ -112,6 +118,23 @@ window.__ModuleLoader__.load({
       applyBarMode();
       PINS_EVENTS.dispatchEvent(new CustomEvent('bar-mode', { detail: { mode: next } }));
       return next;
+    }
+
+    /**
+     * Whether Alt+P toggles the pin.
+     *
+     * Off means the key is left entirely alone — no `preventDefault`, no action — for people
+     * whose other tools already claim it. Read at event time, so toggling takes effect
+     * without re-binding the listener.
+     */
+    const SHORTCUT_KEY = 'dsh-pins/shortcut';
+    let shortcutOn = readJson(SHORTCUT_KEY, true) !== false;
+    /** Persist the switch and tell the open settings page to re-read it. */
+    function setShortcut(on) {
+      shortcutOn = on !== false;
+      writeJson(SHORTCUT_KEY, shortcutOn);
+      PINS_EVENTS.dispatchEvent(new CustomEvent('shortcut', { detail: { on: shortcutOn } }));
+      return shortcutOn;
     }
     /**
      * How much of one selection is stored, in characters.
@@ -2383,6 +2406,23 @@ html[data-dsh-pins-bar-mode="pins"] [data-text-interaction-surface]{visibility:h
   background:var(--dsw-alias-interactive-bg-hover)}
 .dsh-pins-settings .hint{margin:6px 0 0;color:var(--dsw-alias-label-tertiary);
   font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1.7}
+/* Section titles carry their explanation behind an icon: hover for the tooltip, click to pin
+   it open. Keeps the controls above the fold. */
+.dsh-pins-settings .head{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.dsh-pins-settings .head .hint{flex:1 0 100%;margin:2px 0 0}
+.dsh-pins-settings .info{display:inline-flex;align-items:center;justify-content:center;
+  width:18px;height:18px;padding:0;border:0;border-radius:var(--dsw-radius-xs);flex:none;
+  background:0 0;cursor:pointer;color:var(--dsw-alias-label-tertiary);
+  font-size:var(--dsw-font-xs-13-font-size,13px);line-height:1}
+.dsh-pins-settings .info:hover,.dsh-pins-settings .info[aria-expanded="true"]{
+  color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}
+.dsh-pins-settings .toggle{min-width:64px;padding:4px 10px;margin-left:auto;
+  border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);
+  background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font:inherit;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);cursor:pointer;
+  transition:border-color 140ms cubic-bezier(0,0,.2,1)}
+.dsh-pins-settings .toggle[data-on]{border-color:var(--dsw-alias-brand-primary);
+  color:var(--dsw-alias-label-primary)}
 /* ×0 is information, not a problem: dim it instead of colouring it. */
 .dsh-pins-root .tagmgr-count[data-zero]{color:var(--dsw-alias-label-tertiary);opacity:.85}
 .dsh-pins-root .empty{margin:28px 16px;color:var(--dsw-alias-label-secondary);line-height:1.8;
@@ -3182,7 +3222,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             dismissBar('按了 Esc');
             return;
           }
-          if (event.altKey && !event.ctrlKey && !event.metaKey && (event.key === 'p' || event.key === 'P')) {
+          if (shortcutOn && event.altKey && !event.ctrlKey && !event.metaKey && (event.key === 'p' || event.key === 'P')) {
             if (!stateRef.current) return;
             event.preventDefault();
             actionRef.current({ type: stateRef.current.pinned ? 'unpin' : 'pin' });
@@ -6050,6 +6090,35 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * on mount, on every store change, and on demand, so there is no cached figure that
      * can quietly drift from reality.
      */
+    /**
+     * A settings section title whose explanation sits behind an icon.
+     *
+     * Four paragraphs of prose used to push the controls themselves below the fold. The text
+     * is still one hover away (native tooltip) and one click away (expanded in place), and it
+     * no longer owns the width of the page on first sight.
+     */
+    function SettingHead({ title, hint }) {
+      const [open, setOpen] = React.useState(false);
+      return h(
+        'div',
+        { className: 'head' },
+        h('h3', null, title),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'info',
+            title: hint,
+            'aria-label': '说明',
+            'aria-expanded': open ? 'true' : 'false',
+            onClick: () => setOpen((value) => !value),
+          },
+          'ⓘ',
+        ),
+        open ? h('p', { className: 'hint' }, hint) : null,
+      );
+    }
+
     function StorageSettingsTab() {
       const [reading, setReading] = React.useState(() => measureStorage());
       React.useEffect(() => store.subscribe(() => setReading(measureStorage())), []);
@@ -6064,6 +6133,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // open — so its absence means an older build. The copy below then says what each mode
       // actually does there, instead of letting the user discover it by clicking.
       const hostHasBar = document.querySelector('[data-text-interaction-surface]') !== null;
+      const [shortcut, setShortcutState] = React.useState(shortcutOn);
+      React.useEffect(() => {
+        const onChange = () => setShortcutState(shortcutOn);
+        PINS_EVENTS.addEventListener('shortcut', onChange);
+        return () => PINS_EVENTS.removeEventListener('shortcut', onChange);
+      }, []);
       const refresh = React.useCallback(() => setReading(measureStorage()), []);
       const percent = (share) => `约 ${(share * 100).toFixed(share < 0.1 ? 1 : 0)}%`;
       const barState = reading.allShare >= 1 ? 'is-full' : reading.allShare >= 0.9 ? 'is-warn' : '';
@@ -6071,7 +6146,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       return h(
         'div',
         { className: 'dsh-pins-settings', 'data-dsh-pins': '' },
-        h('h3', null, '选区浮条'),
+        h(SettingHead, {
+          title: '选区浮条',
+          hint: hostHasBar
+            ? '官方的「引用文本」从 DSH 0.2.2 起提供。选「只用官方」后本插件的浮条不再出现（固定仍可用 Alt+P 和右侧面板）；选「只用我的」会隐藏官方那个按钮，但它的引用渲染照常工作。'
+            : '当前 DSH 没有官方的「引用文本」浮条（0.2.2 之前）。此时选「只用官方」等于关掉本插件的浮条——固定仍可用 Alt+P 和右侧面板；选「只用我的」与默认效果相同。',
+        }),
         h(
           'div',
           { className: 'modes' },
@@ -6084,20 +6164,39 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                 className: 'mode',
                 'data-on': mode === id ? '' : undefined,
                 'aria-pressed': mode === id ? 'true' : 'false',
+                title: BAR_MODE_HINTS[id],
                 onClick: () => setModeState(setBarMode(id)),
               },
               BAR_MODE_LABELS[id],
             ),
           ),
         ),
+        h(SettingHead, {
+          title: '快捷键',
+          hint: 'Alt + P 固定或取消固定当前选区。它挂在页面级监听上；若与别的扩展或插件冲突，可以在这里关掉，关掉不影响浮条按钮与右侧面板。',
+        }),
         h(
-          'p',
-          { className: 'hint' },
-          hostHasBar
-            ? '官方的「引用文本」从 DSH 0.2.2 起提供。选「只用官方」后本插件的浮条不再出现（固定仍可用 Alt+P 和右侧面板）；选「只用我的」会隐藏官方那个按钮，但它的引用渲染照常工作。'
-            : '当前 DSH 没有官方的「引用文本」浮条（0.2.2 之前）。此时选「只用官方」等于关掉本插件的浮条——固定仍可用 Alt+P 和右侧面板；选「只用我的」与默认效果相同。',
+          'div',
+          { className: 'row' },
+          h('span', { className: 'k' }, 'Alt + P 固定 / 取消固定'),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'toggle',
+              'data-on': shortcut ? '' : undefined,
+              'aria-pressed': shortcut ? 'true' : 'false',
+              onClick: () => setShortcutState(setShortcut(!shortcut)),
+            },
+            shortcut ? '已开启' : '已关闭',
+          ),
         ),
-        h('h3', null, '已用存储'),
+        h(SettingHead, {
+          title: '已用存储',
+          hint: `片段存在这个站点的浏览器存储里，不上传、不同步；清除「Cookie 及其他网站数据」会一并清掉，换端口或域名访问也看不到同一份。百分比按字符数 ÷ 约 ${(STORAGE_CHARS_LIMIT / 10000).toFixed(0)} 万估算（不同浏览器的上限不同，所以标「约」）。${
+            reading.ourKeys > 0 ? `本插件目前占用 ${reading.ourKeys} 个存储键。` : ''
+          }`,
+        }),
         reading.unavailable
           ? h(
               'div',
@@ -6140,19 +6239,6 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             )
           : null,
         h('div', { className: 'row' }, h('button', { type: 'button', className: 'mini', onClick: refresh }, '重新统计')),
-        h(
-          'p',
-          { className: 'hint' },
-          '片段存在这个站点的浏览器存储里，不上传、不同步；清除「Cookie 及其他网站数据」会一并清掉，换端口或域名访问也看不到同一份。',
-        ),
-        h(
-          'p',
-          { className: 'hint' },
-          `百分比按本站存储的字符数 ÷ 约 ${(STORAGE_CHARS_LIMIT / 10000).toFixed(0)} 万估算，不同浏览器的上限不同，所以标「约」。`,
-        ),
-        reading.ourKeys > 0
-          ? h('p', { className: 'hint' }, `本插件目前占用 ${reading.ourKeys} 个存储键。`)
-          : null,
       );
     }
 
