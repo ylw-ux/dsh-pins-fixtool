@@ -144,6 +144,8 @@ Either way the passage really reaches the model, and never expires afterwards.
 
 **Keyboard shortcut**: `Alt + P` pins / unpins; turn it off here if it clashes with another extension.
 
+**Hover bar**: pointing at a filed passage shows 取消固定 / 引用 / 标签 / 复制 next to the cursor. Turning it off also removes the hover highlight and the two edge marks; clicking a mark to reveal its card keeps working.
+
 **Storage used** (read-only):
 
 | Figure | What it is |

@@ -127,6 +127,23 @@ window.__ModuleLoader__.load({
      * whose other tools already claim it. Read at event time, so toggling takes effect
      * without re-binding the listener.
      */
+    /**
+     * Whether pointing at a filed passage opens its action bar.
+     *
+     * A preference, not a permission: the pointer layer adds a highlight, two edge marks and a
+     * bar near the cursor, and some people simply do not want anything appearing under the
+     * mouse. Clicking a mark to reveal its card stays available either way — that is a
+     * deliberate click, not a side effect of moving.
+     */
+    const PIN_HOVER_KEY = 'dsh-pins/hover';
+    let pinHoverOn = readJson(PIN_HOVER_KEY, true) !== false;
+    function setPinHover(on) {
+      pinHoverOn = on !== false;
+      writeJson(PIN_HOVER_KEY, pinHoverOn);
+      if (!pinHoverOn) clearPinHover();
+      PINS_EVENTS.dispatchEvent(new CustomEvent('pin-hover-mode', { detail: { on: pinHoverOn } }));
+      return pinHoverOn;
+    }
     const SHORTCUT_KEY = 'dsh-pins/shortcut';
     let shortcutOn = readJson(SHORTCUT_KEY, true) !== false;
     /** Persist the switch and tell the open settings page to re-read it. */
@@ -1891,6 +1908,11 @@ window.__ModuleLoader__.load({
         pinHoverState.frame = 0;
         const event = pinHoverState.lastEvent;
         if (!event) return;
+        // The pointer layer is optional: with it off, moving the mouse does nothing at all.
+        if (!pinHoverOn) {
+          clearPinHover();
+          return;
+        }
         if (markerState.ranges.size === 0) {
           clearPinHover();
           return;
@@ -1930,6 +1952,7 @@ window.__ModuleLoader__.load({
       };
 
       const onMove = (event) => {
+        if (!pinHoverOn) return;
         pinHoverState.lastEvent = event;
         if (pinHoverState.frame !== 0) return;
         pinHoverState.frame = window.requestAnimationFrame(run);
@@ -6648,6 +6671,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       // open — so its absence means an older build. The copy below then says what each mode
       // actually does there, instead of letting the user discover it by clicking.
       const hostHasBar = document.querySelector('[data-text-interaction-surface]') !== null;
+      const [hoverOn, setHoverState] = React.useState(pinHoverOn);
+      React.useEffect(() => {
+        const onChange = () => setHoverState(pinHoverOn);
+        PINS_EVENTS.addEventListener('pin-hover-mode', onChange);
+        return () => PINS_EVENTS.removeEventListener('pin-hover-mode', onChange);
+      }, []);
       // Passages filed before the no-overlap rule can still overlap each other. Counted so the
       // user can tidy them up; nothing here ever edits them.
       const overlapCount = React.useMemo(() => {
@@ -6711,6 +6740,26 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               onClick: () => setShortcutState(setShortcut(!shortcut)),
             },
             shortcut ? '已开启' : '已关闭',
+          ),
+        ),
+        h(SettingHead, {
+          title: '悬停浮条',
+          hint: '鼠标停在已固定段落上时，指针旁会弹出「取消固定 / 引用 / 标签 / 复制」，并给这一段加深高亮与首尾边界线。关掉后这些悬停效果都不再出现；点一下标记跳到卡片仍然可用。',
+        }),
+        h(
+          'div',
+          { className: 'row' },
+          h('span', { className: 'k' }, '指针悬停显示浮条'),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'toggle',
+              'data-on': hoverOn ? '' : undefined,
+              'aria-pressed': hoverOn ? 'true' : 'false',
+              onClick: () => setHoverState(setPinHover(!hoverOn)),
+            },
+            hoverOn ? '已开启' : '已关闭',
           ),
         ),
         h(SettingHead, {
