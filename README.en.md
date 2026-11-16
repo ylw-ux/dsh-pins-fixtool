@@ -6,29 +6,22 @@
 
 A Web UI plugin for [DeepSeek Harness](https://github.com/deepseek-ai). What gets lost while reading a long reply is *where was I, and which sentences actually mattered* — select, pin, come back. That is the whole of it.
 
-## What's new: 1.0.6 (2026-11-10)
+## What's new: 1.0.7 (2026-11-16)
 
-**This is a hotfix**: it adapts to the official 「引用文本」 (Quote text) selection toolbar added in **DSH 0.2.2**, and fixes "a newly pinned passage shows no emphasis".
-
-**Backward compatible** — users still on an older DSH (before 0.2.2) keep working exactly as before and can upgrade safely. Even if your DSH has no host toolbar yet, this release also fixes a bug, so it is still worth taking.
+**This release connects the transcript and the cards in both directions.** Until now a card could jump back to its passage; now the passage itself can act on its card.
 
 | Change | What it does |
 |---|---|
-| **Adapted to the host toolbar** | The host's above, this plugin's below; both step aside when the selection is near the top or bottom edge |
-| **Toolbar mode setting** | Settings → Plugins → Pinned passages › Selection toolbar, one of three |
-| **Fixed "no emphasis after pinning"** | Scrolls the new card into view, then pulses; says so when a search or tag filter is hiding it |
+| **Hover bar** | Rest the pointer on pinned text for ~0.12s and 「取消固定 / 引用 / 标签 / 复制」 appears next to the cursor. The passage brightens and gets a 2px edge mark at each end |
+| **Click to locate** | A click (no drag) on a mark scrolls the side panel to its card and pulses it. Hit testing is per character, so blank table cells never trigger it |
+| **No more duplicates** | A selection overlapping a filed passage is refused, and the existing passage is revealed; touching ends are not an overlap |
+| **Shading = the saved passage** | The old "grow short quotes to word boundaries" step is gone, so the edges are exact |
+| **Tighter settings page** | Each section's explanation moved behind a ⓘ (hover or click); `Alt+P` and the hover bar can each be switched off |
+| **Smoother** | Marker repaints only re-locate the row that changed and skip repainting when nothing moved; selecting no longer parses the selection on every event |
 
-**Older DSH (before 0.2.2, no host toolbar) — what each mode does there:**
+**Compatibility**: the data format is unchanged — one new preference key `dsh-pins/hover`. Upgrading touches neither passages nor tags. Overlaps that already existed are **never rewritten**; settings reports how many there are.
 
-| Mode you pick | What actually happens |
-|---|---|
-| **Show both** (default) | Only this plugin's bar, as before |
-| **This plugin's bar only** | Same as default — nothing to hide — and nothing breaks |
-| **The host's 「引用文本」 only** | **This plugin's bar disappears** (that build has no host bar). Pinning still works via `Alt+P` and the side panel; switch back to restore it |
-
-> On an older build the settings page states this difference right under the switch, so nobody has to find out by clicking.
-> Rule of thumb: **on an older DSH, keep one of the first two modes.**
-
+> Prefer nothing appearing under the pointer? **Settings → Plugins → Pinned passages › Hover bar** turns it all off; click-to-locate keeps working.
 ## Install
 
 Requires the Harness Web UI (`dsh web`). One command — it also **selects the bundle into your profile** for you:
@@ -84,7 +77,22 @@ Select text in the conversation; an action bar appears above the selection:
 > **DSH 0.2.2 ships its own selection toolbar, 「引用文本」 (Quote text).** Both are shown by default: the host's above the selection, this plugin's below it (pin / tag / quote live on the lower one).
 > To keep only one, go to **Settings → Plugins → Pinned passages › Selection toolbar**.
 
-### 2. Tags: type a letter and pick from the ones you already have
+- **The same passage is never filed twice**: a selection that overlaps a filed passage is refused and the existing one is revealed (touching ends do not count).
+
+### 2. Marks in the transcript: hover and click
+
+Pinned passages keep a shaded mark. Rest the pointer on one:
+
+| Action | Result |
+|---|---|
+| Dwell ~0.12s | A bar appears next to the cursor: **取消固定 / 引用 / 标签 / 复制** |
+| **Click** (no drag) | The side panel scrolls to its card and pulses it |
+| **Drag** | Still just selects text — no jump |
+
+- While hovered, that passage brightens and gets a 2px edge mark at each end, so two adjacent passages show exactly where one stops
+- Hit testing asks "which character is under the pointer?", so blank table cells and trailing space never trigger it
+- Do not want it? **Settings › Hover bar** turns it off; click-to-locate keeps working
+### 3. Tags: type a letter and pick from the ones you already have
 
 Type in a card's tag box, or in the bar's tag box, and the existing tags that match appear right below:
 
@@ -103,7 +111,7 @@ Details:
 - A tag name is capped at 24 characters; leading `#` and repeated whitespace are normalised away.
 - **Tags are one vocabulary across conversations**: a tag created anywhere can be picked everywhere.
 
-### 3. Create tags first, file passages later
+### 4. Create tags first, file passages later
 
 Organising often starts with a list of names, not with the passages. Use **＋ 标签** at the right end of the panel's tools row:
 
@@ -121,7 +129,7 @@ A freshly created tag has no passages, so it shows as **`×0`** under **「全�
 - Standalone tags appear in the 「全部」 view only: 「本对话」 counts what this conversation holds, not the global vocabulary
 - At most 200 tags
 
-### 4. Quote into a message
+### 5. Quote into a message
 
 Two shapes, and **both carry their content — neither is a pointer**:
 
@@ -130,7 +138,7 @@ Two shapes, and **both carry their content — neither is a pointer**:
 
 Either way the passage really reaches the model, and never expires afterwards.
 
-### 5. Settings: the selection toolbar and storage usage
+### 6. Settings: three switches and storage usage
 
 **Settings → Plugins → Pinned passages**.
 
@@ -156,7 +164,7 @@ Either way the passage really reaches the model, and never expires afterwards.
 
 Recalculates after pinning, deleting or re-tagging.
 
-### 6. The side panel
+### 7. The side panel
 
 | Action | Effect |
 |---|---|
