@@ -1722,10 +1722,17 @@ window.__ModuleLoader__.load({
             // so an unchanged row needs no re-location at all. Streaming mutates one row at a
             // time, and without this every pass re-located every pin in the conversation.
             const cached = markerState.located.get(pin.id);
-            const located =
-              cached && cached.row === row && row.isConnected === true
-                ? cached
-                : Object.assign({ row }, locateQuote(row, pin));
+            // Reuse only when the row still holds the passage: a cached range whose boundary
+            // nodes were replaced by a re-render must be re-located, or every later pass keeps
+            // painting (and hit-testing) a detached range.
+            const reusable =
+              cached &&
+              cached.row === row &&
+              row.isConnected === true &&
+              cached.range &&
+              cached.range.startContainer?.isConnected !== false &&
+              cached.range.endContainer?.isConnected !== false;
+            const located = reusable ? cached : Object.assign({ row }, locateQuote(row, pin));
             markerState.located.set(pin.id, located);
             if (located.range) {
               ranges.push(located.range);
@@ -1862,6 +1869,16 @@ window.__ModuleLoader__.load({
       if (!point) return null;
       let boundary = null;
       for (const [pinId, range] of markerState.ranges) {
+        // A cached range can outlive the nodes it points at when a row re-renders. The observer
+        // normally drops it first, but a detached boundary makes `comparePoint` throw and the
+        // click would then look like a miss — so a stale range is dropped here and a repaint
+        // is asked for, which re-locates it.
+        if (range.startContainer?.isConnected === false || range.endContainer?.isConnected === false) {
+          markerState.ranges.delete(pinId);
+          markerState.located.delete(pinId);
+          scheduleMarkers(true);
+          continue;
+        }
         let side;
         try {
           side = range.comparePoint(point.node, point.offset);
@@ -2035,7 +2052,10 @@ window.__ModuleLoader__.load({
         const selection = doc.getSelection();
         if (selection && !selection.isCollapsed) return;
         const pinId = pinAtPoint(event.clientX, event.clientY);
-        if (pinId !== null) PINS_EVENTS.dispatchEvent(new CustomEvent('chip-reveal', { detail: { pinId } }));
+        if (pinId !== null) {
+          console.info('[dsh-pins] 点击标记 → 定位卡片', pinId);
+          PINS_EVENTS.dispatchEvent(new CustomEvent('chip-reveal', { detail: { pinId } }));
+        }
       };
 
       doc.addEventListener('mousemove', onMove, { passive: true });
@@ -3816,8 +3836,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         };
         const onPointerDown = (event) => {
           if (event.button !== 0) return;
-          // Pressing inside the bar means "use it", not "start selecting".
+          // Pressing inside a bar means "use it", not "start selecting". The bar carries
+          // `data-dsh-pins-bar` rather than `data-dsh-pins`, so `isOwnUi` alone missed it — and
+          // dismissing the bar on its own button press is why its buttons stopped responding:
+          // the click never landed, because the target was gone.
           if (isOwnUi(event.target)) return;
+          if (event.target?.closest?.('[data-dsh-pins-bar],.dsh-pins-hoverbar')) return;
           dragging = true;
           // A fresh drag replaces the old selection; leaving the old bar up with stale content
           // is worse than closing it for the moment the drag lasts.
