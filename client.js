@@ -1498,8 +1498,26 @@ window.__ModuleLoader__.load({
      * Only the Session on screen is marked, so switching Sessions never claims
      * pins that belong elsewhere.
      */
-    const markerState = { sessionId: null, refreshTimer: null, refreshSoon: false, observer: null, indexCache: new WeakMap(), applying: false, ranges: new Map() };
+    const markerState = {
+  sessionId: null,
+  refreshTimer: null,
+  refreshSoon: false,
+  observer: null,
+  indexCache: new WeakMap(),
+  applying: false,
+  ranges: new Map(),
+  /** Last located range per pin, so a pass only re-locates the rows that changed. */
+  located: new Map(),
+  /** What is currently painted, compared by identity to skip redundant repaints. */
+  painted: [],
+};
 
+    /** Forget every located range that belongs to one row, so the next pass re-locates it. */
+    function dropLocatedFor(row) {
+      for (const [pinId, entry] of markerState.located) {
+        if (entry?.row === row) markerState.located.delete(pinId);
+      }
+    }
     /** Per-row text index, reused until the row's DOM changes (the observer clears it). */
     function cachedIndex(row) {
       const hit = markerState.indexCache.get(row);
@@ -1511,8 +1529,13 @@ window.__ModuleLoader__.load({
 
     function markedRows() {
       try {
+        // Scoped to the transcript when the host exposes its scroll container. A document-wide
+        // query walks the sidebars, the composer and the settings pages on every pass, and
+        // this pass runs on every streamed token. The attribute is part of the host contract
+        // this plugin already relies on; without it the query falls back to the document.
+        const scope = document.querySelector('[data-conversation-scroll]') ?? document;
         const found = [];
-        for (const row of document.querySelectorAll('[data-chat-flow-key],[data-chat-anchor-key]')) {
+        for (const row of scope.querySelectorAll('[data-chat-flow-key],[data-chat-anchor-key]')) {
           if (row.closest('[data-dsh-pins]')) continue;
           found.push(row);
         }
@@ -1678,18 +1701,32 @@ window.__ModuleLoader__.load({
         const seen = new Set();
         if (sessionId) {
           const rows = markedRows();
+          // One lookup table per pass. Asking every row about every pin made a long
+          // conversation quadratic, and this pass runs on every streamed token. First
+          // occurrence wins, exactly like the scan it replaces.
+          const byKey = new Map();
+          for (const row of rows) {
+            const flow = row.getAttribute('data-chat-flow-key');
+            if (flow && !byKey.has(flow)) byKey.set(flow, row);
+            const anchor = row.getAttribute('data-chat-anchor-key');
+            if (anchor && !byKey.has(anchor)) byKey.set(anchor, row);
+          }
           for (const pin of store.list(sessionId)) {
             seen.add(pin.id);
-            const row = rows.find(
-              (candidate) =>
-                candidate.getAttribute('data-chat-flow-key') === pin.anchor?.flowKey ||
-                candidate.getAttribute('data-chat-anchor-key') === pin.anchor?.flowKey,
-            );
+            const row = byKey.get(pin.anchor?.flowKey) ?? null;
             if (!row) {
               reportMarker(pin.id, 'pending');
               continue;
             }
-            const located = locateQuote(row, pin);
+            // Reuse the previous range when the row still holds it: a Range tracks the DOM,
+            // so an unchanged row needs no re-location at all. Streaming mutates one row at a
+            // time, and without this every pass re-located every pin in the conversation.
+            const cached = markerState.located.get(pin.id);
+            const located =
+              cached && cached.row === row && row.isConnected === true
+                ? cached
+                : Object.assign({ row }, locateQuote(row, pin));
+            markerState.located.set(pin.id, located);
             if (located.range) {
               ranges.push(located.range);
               markerState.ranges.set(pin.id, located.range);
@@ -1702,12 +1739,25 @@ window.__ModuleLoader__.load({
         for (const id of [...markerReport.keys()]) {
           if (!seen.has(id)) markerReport.delete(id);
         }
+        // A deleted pin must not linger in the location cache: nothing visits it again, so the
+        // entry would live for the rest of the page's life and keep its row alive with it.
+        for (const id of [...markerState.located.keys()]) {
+          if (!seen.has(id)) markerState.located.delete(id);
+        }
 
         if (canUseHighlight) {
-          // Replacing the registry entry in one call keeps the previous marks
-          // visible until the new ones are ready, so a refresh never blanks them.
-          if (ranges.length > 0) registry.set('dsh-pins-mark', new globalThis.Highlight(...ranges));
-          else registry.delete('dsh-pins-mark');
+          // Replacing the registry entry in one call keeps the previous marks visible until
+          // the new ones are ready, so a refresh never blanks them. When the very same Range
+          // objects come back — which is the normal case while a different row streams — the
+          // registry already paints exactly this, and re-setting it only costs a repaint.
+          const painted = markerState.painted;
+          const unchanged =
+            ranges.length === painted.length && ranges.every((range, index) => range === painted[index]);
+          if (!unchanged) {
+            if (ranges.length > 0) registry.set('dsh-pins-mark', new globalThis.Highlight(...ranges));
+            else registry.delete('dsh-pins-mark');
+            markerState.painted = ranges.slice();
+          }
         } else {
           unwrapMarks();
           for (const range of ranges) {
@@ -1761,6 +1811,7 @@ window.__ModuleLoader__.load({
       markerState.sessionId = next;
       // A different conversation means every cached row belongs to another session.
       markerState.indexCache = new WeakMap();
+      markerState.located.clear();
       scheduleMarkers(false);
     }
 
@@ -1953,6 +2004,18 @@ window.__ModuleLoader__.load({
 
       const onMove = (event) => {
         if (!pinHoverOn) return;
+        // A one-pixel wiggle cannot change which passage is under the pointer, and a hidden
+        // page has nothing to paint. Two number comparisons keep the frame scheduler untouched
+        // for most pointer movement.
+        if (document.hidden === true) return;
+        const previous = pinHoverState.lastEvent;
+        if (
+          previous !== null &&
+          Math.abs(previous.clientX - event.clientX) < 2 &&
+          Math.abs(previous.clientY - event.clientY) < 2
+        ) {
+          return;
+        }
         pinHoverState.lastEvent = event;
         if (pinHoverState.frame !== 0) return;
         pinHoverState.frame = window.requestAnimationFrame(run);
@@ -2027,12 +2090,14 @@ window.__ModuleLoader__.load({
             if (!row) continue;
             if (markerState.indexCache.has(row)) {
               markerState.indexCache.delete(row);
+              dropLocatedFor(row);
               touched = true;
               continue;
             }
             const owner = row.closest?.('[data-chat-flow-key],[data-chat-anchor-key]');
             if (owner && markerState.indexCache.has(owner)) {
               markerState.indexCache.delete(owner);
+              dropLocatedFor(owner);
               touched = true;
               continue;
             }
