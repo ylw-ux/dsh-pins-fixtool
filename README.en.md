@@ -6,7 +6,9 @@
 
 A Web UI plugin for [DeepSeek Harness](https://github.com/deepseek-ai). What gets lost while reading a long reply is *where was I, and which sentences actually mattered* — select, pin, come back. That is the whole of it.
 
-## What's new: 1.1.0 (2026-11-16)
+## What's new: 1.1.1 (2026-11-16)
+
+> **1.1.1 only fixes the version number in the README shipped inside the npm package; the code is identical to 1.1.0.** The notes below describe 1.1.0.
 
 **This release connects the transcript and the cards in both directions.** Until now a card could jump back to its passage; now the passage itself can act on its card.
 
