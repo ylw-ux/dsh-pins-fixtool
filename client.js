@@ -3784,10 +3784,24 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           }
           return false;
         };
+        // Reading a selection walks the selected text twice and re-renders the bar, and
+        // `selectionchange` fires several times per pointer move while dragging. Two changes
+        // keep the drag itself cheap:
+        //   1. reads are coalesced to one per animation frame;
+        //   2. while the pointer is down nothing is read at all — the bar appears on release,
+        //      which is when it is actually useful.
+        let dragging = false;
+        let readFrame = 0;
+        const readNow = () => {
+          readFrame = 0;
+          const range = dom.range();
+          if (range) accept(range);
+        };
         const onSelectionChange = () => {
+          if (dragging) return;
           const range = dom.range();
           if (range) {
-            accept(range);
+            if (readFrame === 0) readFrame = window.requestAnimationFrame(readNow);
             return;
           }
           if (!stateRef.current) return;
@@ -3799,6 +3813,24 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             return;
           }
           dismissBar('选区没了（点了别处或浏览器清了选区）');
+        };
+        const onPointerDown = (event) => {
+          if (event.button !== 0) return;
+          // Pressing inside the bar means "use it", not "start selecting".
+          if (isOwnUi(event.target)) return;
+          dragging = true;
+          // A fresh drag replaces the old selection; leaving the old bar up with stale content
+          // is worse than closing it for the moment the drag lasts.
+          if (stateRef.current) dismissBar('重新划选');
+        };
+        const onPointerUp = () => {
+          if (!dragging) return;
+          dragging = false;
+          const range = dom.range();
+          if (range) accept(range);
+        };
+        const onPointerCancel = () => {
+          dragging = false;
         };
         const onKeyDown = (event) => {
           // The tag box runs its own Escape chain (close the list, then the box). This
@@ -3816,6 +3848,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           }
         };
         const onBlur = () => {
+          // A pointer released outside the window never delivers pointerup here; without
+          // this the reader would stay disabled until the next click.
+          dragging = false;
           if (!stateRef.current) return;
           let active = '（读不到焦点）';
           try {
@@ -3843,12 +3878,19 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           dismissBar('页面滚动或窗口缩放了');
         };
         document.addEventListener('selectionchange', onSelectionChange);
+        document.addEventListener('pointerdown', onPointerDown, true);
+        document.addEventListener('pointerup', onPointerUp, true);
+        document.addEventListener('pointercancel', onPointerCancel, true);
         document.addEventListener('keydown', onKeyDown, true);
         document.addEventListener('scroll', onScrollOrResize, true);
         window.addEventListener('blur', onBlur);
         window.addEventListener('resize', onScrollOrResize);
         return () => {
           document.removeEventListener('selectionchange', onSelectionChange);
+          document.removeEventListener('pointerdown', onPointerDown, true);
+          document.removeEventListener('pointerup', onPointerUp, true);
+          document.removeEventListener('pointercancel', onPointerCancel, true);
+          window.cancelAnimationFrame(readFrame);
           document.removeEventListener('keydown', onKeyDown, true);
           document.removeEventListener('scroll', onScrollOrResize, true);
           window.removeEventListener('blur', onBlur);
