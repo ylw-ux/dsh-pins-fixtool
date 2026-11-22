@@ -154,7 +154,7 @@ Either way the passage really reaches the model, and never expires afterwards.
 
 **Hover bar**: pointing at a filed passage shows 取消固定 / 引用 / 标签 / 复制 next to the cursor. Turning it off also removes the hover highlight and the two edge marks; clicking a mark to reveal its card keeps working.
 
-**Backup & restore**: export a JSON backup (everything / current conversation). An import is previewed before it is confirmed; conflicts can be overwritten row by row, and the full diff opens in a new tab. Import merges — it never deletes.
+**Backup & restore**: export a JSON backup (everything / current conversation) — "current conversation" is the one open in the main column, so the side panel does not need to be open. An import is previewed before it is confirmed; conflicts can be overwritten row by row, and the full diff opens in a new tab. Import merges — it never deletes.
 
 **Storage used** (read-only):
 

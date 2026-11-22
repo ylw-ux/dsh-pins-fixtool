@@ -7876,7 +7876,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             {
               type: 'button',
               className: 'mini',
-              title: scopedSession ? '只导出右侧栏当前这个对话' : '右侧栏没有打开的对话',
+              title: scopedSession
+                ? `只导出「${readSessionTitle(context, scopedSession) || '主栏当前对话'}」——右侧面板开着或关着都算`
+                : '主栏没有正在查看的对话，也没有打开的面板',
               // Not disabled: a greyed button explains nothing. Clicking it says why it cannot
               // act, which is the same rule the rest of this plugin follows.
               onClick: () => {
