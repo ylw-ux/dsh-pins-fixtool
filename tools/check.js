@@ -18,6 +18,7 @@ const steps = [
   { title: '备份往返（值级）', args: ['test/round-trip.js'] },
   { title: '坏文件拒绝', args: ['test/bad-file.js'] },
   { title: '降级可读性', args: ['test/downgrade.js'] },
+  { title: '冲突对比 markdown', args: ['test/conflict-markdown.js'] },
   { title: '标签补全排序', args: ['test/suggest-tags.js'] },
   { title: '标签键盘语义', args: ['test/tagkeys.js'] },
   { title: '独立标签容错', args: ['test/extra-tags.js'] },
@@ -44,3 +45,4 @@ for (const step of steps) {
 
 if (failed === 0) console.log('\n✓ 全部检查通过');
 process.exit(failed);
+

@@ -803,6 +803,17 @@ window.__ModuleLoader__.load({
           return extraTags.slice();
         },
         /**
+         * Re-read every key this store owns.
+         *
+         * Import writes storage by hand (there is no transaction to lean on), so the store
+         * reloads instead of mirroring that write in memory: one source of truth.
+         */
+        reload() {
+          data = normalizeData(readJson(STATE_KEY, null));
+          extraTags = normalizeExtraTags(readJson(EXTRA_TAGS_KEY, null));
+          notify();
+        },
+        /**
          * Add a standalone tag — a name saved before any passage uses it.
          *
          * @returns `{ ok, reason?, tag?, persisted? }`; `duplicate`, `full` and `empty`
@@ -2785,6 +2796,17 @@ html[data-dsh-pins-bar-mode="pins"] [data-text-interaction-surface]{visibility:h
   font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1.7}
 /* Section titles carry their explanation behind an icon: hover for the tooltip, click to pin
    it open. Keeps the controls above the fold. */
+.dsh-pins-settings .preview{margin-top:2px;padding:8px;display:flex;flex-direction:column;gap:6px;
+  border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm)}
+.dsh-pins-settings .conflicts{display:flex;flex-direction:column;gap:4px;max-height:260px;overflow-y:auto;
+  overscroll-behavior:contain}
+.dsh-pins-settings .conflict{display:flex;align-items:baseline;gap:6px;cursor:pointer;
+  font-size:var(--dsw-font-xxs-12-font-size,12px);color:var(--dsw-alias-label-secondary)}
+.dsh-pins-settings .conflict .diff{flex:none;color:var(--dsw-alias-state-warn-primary)}
+.dsh-pins-settings .conflict .snippet{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--dsw-alias-label-tertiary)}
+.dsh-pins-settings .conflict input,.dsh-pins-settings label.mini input{flex:none;margin:0}
+.dsh-pins-settings label.mini{display:inline-flex;align-items:center;gap:4px;cursor:pointer}
 .dsh-pins-settings .head{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .dsh-pins-settings .head .hint{flex:1 0 100%;margin:2px 0 0}
 .dsh-pins-settings .info{display:inline-flex;align-items:center;justify-content:center;
@@ -5024,12 +5046,259 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           plan.add.push({ sessionId, pin });
         }
       }
+      const extraTags = [];
+      for (const tag of backup?.data?.extraTags ?? []) {
+        const name = normalizeTag(tag);
+        if (name !== '' && !extraTags.includes(name)) extraTags.push(name);
+      }
+      const sessionMeta = {};
+      for (const [sessionId, entry] of Object.entries(backup?.data?.sessions ?? {})) {
+        sessionMeta[sessionId] = {
+          firstAt: backupNumber(entry?.firstAt, 0),
+          updatedAt: backupNumber(entry?.updatedAt, 0),
+          title: backupString(entry?.title, BACKUP_MAX_TITLE),
+        };
+      }
       return {
         add: plan.add,
         mergeTags: [...plan.mergeTags.values()],
         conflicts: plan.conflicts,
         duplicates: plan.duplicates,
+        // Carried so `applyImport` does not have to re-read the file for these three.
+        extraTags,
+        sessionOrder: Object.keys(backup?.data?.sessions ?? {}),
+        sessionMeta,
+        msgOrder: backup?.data?.msgOrder ?? {},
+        preferences: backup?.preferences ?? null,
       };
+    }
+
+    /**
+     * Apply one import plan to storage, once, with rollback.
+     *
+     * Local storage gives us no transaction, so the affected keys are written by hand after
+     * snapshotting their raw values; any failure restores that snapshot and leaves the store as
+     * it was. The store then reloads from storage instead of being patched in memory — one
+     * source of truth, and the same one a page refresh would see.
+     *
+     * @param plan - the result of `planImport`.
+     * @param options.overwrite - Set of `${sessionId}\u0000${pinId}` chosen in the conflict panel.
+     * @param options.preferences - apply the file's preferences too (default: keep local).
+     */
+    function applyImport(plan, options) {
+      const overwrite = options?.overwrite instanceof Set ? options.overwrite : new Set();
+      const importPreferences = options?.preferences === true;
+      const keys = [STATE_KEY, EXTRA_TAGS_KEY, STABLE_ORDER_KEY, MODE_KEY, BAR_MODE_KEY, PIN_HOVER_KEY, SHORTCUT_KEY, PANEL_HEIGHT_KEY];
+      const snapshot = new Map();
+      let storage = null;
+      try {
+        storage = globalThis.localStorage ?? null;
+        if (!storage) throw new Error('localStorage unavailable');
+        for (const key of keys) snapshot.set(key, storage.getItem(key));
+      } catch (error) {
+        return { ok: false, message: `这个页面不允许访问本地存储：${String(error?.message ?? error)}` };
+      }
+
+      try {
+        const current = normalizeData(readJson(STATE_KEY, null));
+        const sessions = { ...current.sessions };
+        const counts = { added: 0, overwritten: 0, tagsMerged: 0 };
+        const entryFor = (sessionId) => {
+          const key = String(sessionId);
+          if (!sessions[key]) sessions[key] = { pins: [], firstAt: Date.now(), updatedAt: Date.now() };
+          if (!Array.isArray(sessions[key].pins)) sessions[key].pins = [];
+          return sessions[key];
+        };
+
+        for (const row of plan.add ?? []) {
+          entryFor(row.sessionId).pins = [...entryFor(row.sessionId).pins, row.pin];
+          counts.added += 1;
+        }
+        for (const conflict of plan.conflicts ?? []) {
+          if (!overwrite.has(`${conflict.sessionId}\u0000${conflict.local.id}`)) continue;
+          const entry = sessions[String(conflict.sessionId)];
+          if (!entry) continue;
+          entry.pins = entry.pins.map((pin) => (pin.id === conflict.local.id ? { ...conflict.incoming } : pin));
+          counts.overwritten += 1;
+        }
+        for (const merge of plan.mergeTags ?? []) {
+          const pin = sessions[String(merge.sessionId)]?.pins?.find((each) => each.id === merge.id);
+          if (!pin) continue;
+          if (merge.tags.length <= (pin.tags ?? []).length) continue;
+          pin.tags = [...merge.tags];
+          counts.tagsMerged += 1;
+        }
+        for (const [sessionId, meta] of Object.entries(plan.sessionMeta ?? {})) {
+          const entry = sessions[String(sessionId)];
+          if (!entry) continue;
+          if (meta.firstAt > 0 && !entry.firstAt) entry.firstAt = meta.firstAt;
+          if (meta.updatedAt > 0) entry.updatedAt = meta.updatedAt;
+          if (meta.title && !entry.title) entry.title = meta.title;
+        }
+
+        const order = Array.isArray(current.order) ? [...current.order] : [];
+        for (const sessionId of plan.sessionOrder ?? []) {
+          if (sessions[sessionId] && !order.includes(sessionId)) order.push(sessionId);
+        }
+
+        const extras = new Set(normalizeExtraTags(readJson(EXTRA_TAGS_KEY, null)));
+        for (const tag of plan.extraTags ?? []) extras.add(tag);
+        const nextExtras = [...extras].slice(0, MAX_EXTRA_TAGS);
+
+        // Message order is a monotonic correction map: never let an import move it backwards.
+        const savedOrder = readJson(STABLE_ORDER_KEY, null);
+        const nextOrder = backupObject(savedOrder) ? { ...savedOrder } : {};
+        for (const [key, value] of Object.entries(plan.msgOrder ?? {})) {
+          const number = backupNumber(value, null);
+          if (number === null) continue;
+          const known = backupNumber(nextOrder[key], null);
+          if (known === null || number > known) nextOrder[key] = number;
+        }
+
+        storage.setItem(STATE_KEY, JSON.stringify({ ...current, sessions, order }));
+        storage.setItem(EXTRA_TAGS_KEY, JSON.stringify(nextExtras));
+        storage.setItem(STABLE_ORDER_KEY, JSON.stringify(nextOrder));
+
+        const prefs = importPreferences ? plan.preferences : null;
+        if (prefs) {
+          if (prefs.mode === 'all' || prefs.mode === 'session') storage.setItem(MODE_KEY, JSON.stringify(prefs.mode));
+          if (prefs.barMode) storage.setItem(BAR_MODE_KEY, JSON.stringify(prefs.barMode));
+          if (typeof prefs.hover === 'boolean') storage.setItem(PIN_HOVER_KEY, JSON.stringify(prefs.hover));
+          if (typeof prefs.shortcut === 'boolean') storage.setItem(SHORTCUT_KEY, JSON.stringify(prefs.shortcut));
+          if (Number.isFinite(prefs.tagmgrHeight)) storage.setItem(PANEL_HEIGHT_KEY, JSON.stringify(prefs.tagmgrHeight));
+        }
+
+        store.reload();
+        stableMsgOrder.clear();
+        loadStableMsgOrder();
+        if (prefs) {
+          if (prefs.barMode) {
+            barMode = prefs.barMode;
+            applyBarMode();
+          }
+          if (typeof prefs.hover === 'boolean') {
+            pinHoverOn = prefs.hover;
+            if (!pinHoverOn) clearPinHover();
+          }
+          if (typeof prefs.shortcut === 'boolean') shortcutOn = prefs.shortcut;
+          PINS_EVENTS.dispatchEvent(new CustomEvent('bar-mode', { detail: { mode: barMode } }));
+          PINS_EVENTS.dispatchEvent(new CustomEvent('pin-hover-mode', { detail: { on: pinHoverOn } }));
+          PINS_EVENTS.dispatchEvent(new CustomEvent('shortcut', { detail: { on: shortcutOn } }));
+        }
+        // Marks belong to the rows currently on screen; a reloaded store may describe different
+        // pins, so the next pass must rebuild instead of reusing the located cache.
+        markerState.located.clear();
+        scheduleMarkers(false);
+        return { ok: true, ...counts };
+      } catch (error) {
+        console.error('[dsh-pins] 导入失败，开始回滚', error);
+        let restored = true;
+        for (const [key, raw] of snapshot) {
+          try {
+            if (raw === null) storage.removeItem(key);
+            else storage.setItem(key, raw);
+          } catch {
+            restored = false;
+          }
+        }
+        try {
+          store.reload();
+          markerState.located.clear();
+          scheduleMarkers(false);
+        } catch {
+          /* the page is in a bad state already; the message below still says what happened */
+        }
+        const detail = String(error?.message ?? error);
+        return {
+          ok: false,
+          restored,
+          message: restored
+            ? `导入失败，已回滚到导入前的数据：${detail}`
+            : `导入失败，且回滚没有完全成功：${detail}。刷新页面后再试。`,
+        };
+      }
+    }
+
+    /**
+     * The Session the sidebar is showing, or null when nothing is open.
+     *
+     * Same two fallbacks the floating bar uses: the mounted Session, then the list's current
+     * one. A global panel can legitimately leave `mounted` empty while a conversation is open.
+     */
+    function currentSessionId(context) {
+      try {
+        const mounted = context?.get?.('sidebarRight')?.mounted?.getSnapshot?.() ?? null;
+        if (mounted) return mounted;
+      } catch {
+        /* the sidebar service may be absent; the list below is the fallback */
+      }
+      try {
+        const current = context?.get?.('sessions')?.list?.getSnapshot?.()?.current;
+        if (current) return current;
+      } catch {
+        /* no list either */
+      }
+      return null;
+    }
+
+    /**
+     * Download a backup, or copy it when the browser refuses the download.
+     *
+     * The same dual channel the markdown outline uses. A refused download that reports success
+     * is the exact lie this plugin has been removing, so the fallback says what happened.
+     */
+    function exportBackupJson(scopeId) {
+      try {
+        const backup = buildBackup(scopeId);
+        let pins = 0;
+        for (const entry of Object.values(backup.data.sessions)) pins += entry.pins.length;
+        if (pins === 0) return { ok: false, message: scopeId ? '这个对话里没有可导出的片段' : '没有可导出的片段' };
+        const text = formatBackupFile(backup);
+        const name = backupFileName(new Date());
+        try {
+          const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement('a');
+          anchor.href = url;
+          anchor.download = name;
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+          return { ok: true, message: `已导出 ${pins} 条到 ${name}`, file: name, pins };
+        } catch (error) {
+          console.error('[dsh-pins] 备份下载失败，改复制到剪贴板', error);
+          try {
+            void navigator.clipboard?.writeText(text);
+            return { ok: true, message: `下载被拒绝，已把备份（${pins} 条）复制到剪贴板`, pins, via: 'clipboard' };
+          } catch {
+            return { ok: false, message: '导出失败：浏览器既不允许下载也不允许写剪贴板' };
+          }
+        }
+      } catch (error) {
+        console.error('[dsh-pins] 导出备份失败', error);
+        return { ok: false, message: `导出失败：${String(error?.message ?? error)}` };
+      }
+    }
+
+    /** Download one JSON artefact (import report); same channel, smaller payload. */
+    function downloadJson(name, value) {
+      try {
+        const text = JSON.stringify(value, null, 2);
+        const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = name;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+        return { ok: true, message: `已保存 ${name}` };
+      } catch (error) {
+        console.error('[dsh-pins] 下载失败', error);
+        return { ok: false, message: `下载被拒绝：${String(error?.message ?? error)}` };
+      }
     }
 
     /** The exact bytes that go into the file: stable key order, two-space indent. */
@@ -7219,6 +7488,45 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * on mount, on every store change, and on demand, so there is no cached figure that
      * can quietly drift from reality.
      */
+    /** Markdown for "open the full diff in a new tab" — no disk writes, same Blob channel. */
+    function buildConflictMarkdown(conflicts) {
+      const rows = Array.isArray(conflicts) ? conflicts : [];
+      const lines = ['# 固定片段导入冲突', '', `共 ${rows.length} 条：同一条 id 在本机与备份里内容不同。默认保留本机，勾选后覆盖。`, ''];
+      const cell = (value) => {
+        const text = Array.isArray(value) ? value.map((tag) => `#${tag}`).join(' ') : String(value ?? '');
+        return text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').slice(0, 300);
+      };
+      for (const conflict of rows) {
+        lines.push(`## ${conflict.local.id}`);
+        lines.push('');
+        lines.push('| 字段 | 本机 | 备份 |');
+        lines.push('|---|---|---|');
+        for (const row of conflict.diff) lines.push(`| ${row.field} | ${cell(row.local)} | ${cell(row.incoming)} |`);
+        lines.push('');
+        lines.push('**本机正文**');
+        lines.push('');
+        lines.push(quoteBlock(conflict.local.text ?? ''));
+        lines.push('');
+        lines.push('**备份正文**');
+        lines.push('');
+        lines.push(quoteBlock(conflict.incoming.text ?? ''));
+        lines.push('');
+      }
+      return lines.join('\n');
+    }
+
+    /** `dsh-pins-import-report-20261122-1435.json` */
+    function importReportFileName(stamp) {
+      const pad = (value) => String(value).padStart(2, '0');
+      return `dsh-pins-import-report-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}.json`;
+    }
+
+    /** A one-line preview of a passage, for the conflict list. */
+    function shortText(value) {
+      const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+      return text.length > 40 ? `${text.slice(0, 40)}…` : text;
+    }
+
     /**
      * A settings section title whose explanation sits behind an icon.
      *
@@ -7248,7 +7556,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
       );
     }
 
-    function StorageSettingsTab() {
+    function StorageSettingsTab({ context }) {
       const [reading, setReading] = React.useState(() => measureStorage());
       React.useEffect(() => store.subscribe(() => setReading(measureStorage())), []);
       const [mode, setModeState] = React.useState(barMode);
@@ -7268,6 +7576,110 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         PINS_EVENTS.addEventListener('pin-hover-mode', onChange);
         return () => PINS_EVENTS.removeEventListener('pin-hover-mode', onChange);
       }, []);
+      // ── 备份与恢复 ────────────────────────────────────────────────
+      const [pending, setPending] = React.useState(null);
+      const [overwrite, setOverwrite] = React.useState(() => new Set());
+      const [importPrefs, setImportPrefs] = React.useState(false);
+      const [busy, setBusy] = React.useState(false);
+      const [report, setReport] = React.useState(null);
+      const fileRef = React.useRef(null);
+      const scopedSession = currentSessionId(context);
+
+      const onPickFile = async (event) => {
+        const file = event.target.files?.[0] ?? null;
+        // Clearing lets the same file be chosen twice in a row.
+        event.target.value = '';
+        if (!file) return;
+        setReport(null);
+        setBusy(true);
+        try {
+          const text = await file.text();
+          const parsed = parseBackup(text);
+          if (!parsed.ok) {
+            setPending(null);
+            setReport({ ok: false, message: parsed.message });
+            return;
+          }
+          const local = readJson(STATE_KEY, null);
+          const plan = planImport(parsed.backup, { sessions: backupObject(local) ? local.sessions ?? {} : {} });
+          setPending({ backup: parsed.backup, plan, stats: parsed.stats, fileName: file.name });
+          setOverwrite(new Set());
+          setImportPrefs(false);
+        } catch (error) {
+          setReport({ ok: false, message: `读取文件失败：${String(error?.message ?? error)}` });
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const toggleConflict = (conflict) => {
+        const key = `${conflict.sessionId}\u0000${conflict.local.id}`;
+        setOverwrite((current) => {
+          const next = new Set(current);
+          if (next.has(key)) next.delete(key);
+          else next.add(key);
+          return next;
+        });
+      };
+      const conflicts = pending?.plan.conflicts ?? [];
+      const allChosen = conflicts.length > 0 && conflicts.every((conflict) => overwrite.has(`${conflict.sessionId}\u0000${conflict.local.id}`));
+      const toggleAll = () => {
+        setOverwrite(allChosen ? new Set() : new Set(conflicts.map((conflict) => `${conflict.sessionId}\u0000${conflict.local.id}`)));
+      };
+
+      const runImport = () => {
+        if (!pending) return;
+        setBusy(true);
+        const result = applyImport(pending.plan, { overwrite, preferences: importPrefs });
+        setBusy(false);
+        if (!result.ok) {
+          setReport({ ok: false, message: result.message });
+          return;
+        }
+        const summary = `新增 ${result.added} 条 · 覆盖 ${result.overwritten} 条 · 标签并集 ${result.tagsMerged} 条 · 跳过重复 ${pending.plan.duplicates} 条`;
+        setReport({ ok: true, message: `导入完成：${summary}` });
+        const saved = downloadJson(importReportFileName(new Date()), {
+          format: 'dsh-pins-import-report',
+          version: 1,
+          importedAt: new Date().toISOString(),
+          source: pending.fileName,
+          stats: {
+            added: result.added,
+            overwritten: result.overwritten,
+            tagsMerged: result.tagsMerged,
+            duplicates: pending.plan.duplicates,
+            conflictsKept: conflicts.length - result.overwritten,
+            invalidRecords: pending.stats.invalidRecords,
+            truncatedText: pending.stats.truncatedText,
+          },
+          preferencesImported: importPrefs,
+          conflicts: conflicts.map((conflict) => ({
+            sessionId: conflict.sessionId,
+            id: conflict.local.id,
+            fields: conflict.diff.map((row) => row.field),
+            overwritten: overwrite.has(`${conflict.sessionId}\u0000${conflict.local.id}`),
+          })),
+        });
+        if (!saved.ok) setReport({ ok: true, message: `导入完成：${summary}（报告文件未能保存）` });
+        setPending(null);
+      };
+
+      const openFullDiff = () => {
+        if (!pending) return;
+        try {
+          const blob = new Blob([buildConflictMarkdown(pending.plan.conflicts)], { type: 'text/markdown;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const opened = window.open(url, '_blank', 'noopener,noreferrer');
+          if (!opened) {
+            URL.revokeObjectURL(url);
+            setReport({ ok: false, message: '浏览器拦住了新标签页：请允许本站弹窗后再点一次' });
+            return;
+          }
+          window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        } catch (error) {
+          setReport({ ok: false, message: `打开对比失败：${String(error?.message ?? error)}` });
+        }
+      };
       // Passages filed before the no-overlap rule can still overlap each other. Counted so the
       // user can tidy them up; nothing here ever edits them.
       const overlapCount = React.useMemo(() => {
@@ -7353,6 +7765,160 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             hoverOn ? '已开启' : '已关闭',
           ),
         ),
+        h(SettingHead, {
+          title: '备份与恢复',
+          hint: 'JSON 备份用于换机器或清缓存后恢复（给机器看）；面板顶部的「导出」是 markdown 提纲（给人看）。导入只合并、不删除：重复的跳过，同一条 id 内容不同时默认保留本机。',
+        }),
+        h(
+          'div',
+          { className: 'row' },
+          h('span', { className: 'k' }, '导出'),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'mini',
+              onClick: () => {
+                const outcome = exportBackupJson(null);
+                setReport({ ok: outcome.ok, message: outcome.message });
+              },
+            },
+            '全部',
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'mini',
+              disabled: !scopedSession,
+              title: scopedSession ? '只导出右侧栏当前这个对话' : '右侧栏没有打开的对话',
+              onClick: () => {
+                const outcome = exportBackupJson(scopedSession);
+                setReport({ ok: outcome.ok, message: outcome.message });
+              },
+            },
+            '本会话',
+          ),
+        ),
+        h(
+          'div',
+          { className: 'row' },
+          h('span', { className: 'k' }, '导入'),
+          h(
+            'button',
+            { type: 'button', className: 'mini', onClick: () => fileRef.current?.click(), disabled: busy },
+            busy ? '读取中…' : '选择备份文件',
+          ),
+          h('input', {
+            ref: fileRef,
+            type: 'file',
+            accept: 'application/json,.json',
+            style: { display: 'none' },
+            onChange: onPickFile,
+          }),
+        ),
+        report ? h('div', { className: report.ok ? 'hint' : 'warn', role: 'status' }, report.message) : null,
+        pending
+          ? h(
+              'div',
+              { className: 'preview' },
+              h('div', { className: 'row' }, h('span', { className: 'k' }, '文件'), h('span', { className: 'v' }, pending.fileName)),
+              h(
+                'div',
+                { className: 'row' },
+                h('span', { className: 'k' }, '内容'),
+                h(
+                  'span',
+                  { className: 'v' },
+                  `${pending.stats.sessions} 个对话 · ${pending.stats.pins} 条片段`,
+                ),
+              ),
+              h(
+                'div',
+                { className: 'row' },
+                h('span', { className: 'k' }, '结果'),
+                h(
+                  'span',
+                  { className: 'v' },
+                  [
+                    `新增 ${pending.plan.add.length}`,
+                    `重复 ${pending.plan.duplicates}`,
+                    `冲突 ${pending.plan.conflicts.length}`,
+                    pending.stats.invalidRecords > 0 ? `无效 ${pending.stats.invalidRecords}` : '',
+                    pending.stats.truncatedText > 0 ? `超长截断 ${pending.stats.truncatedText}` : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' · '),
+                ),
+              ),
+              conflicts.length > 0
+                ? h(
+                    'div',
+                    { className: 'conflicts' },
+                    h(
+                      'div',
+                      { className: 'row' },
+                      h('span', { className: 'k' }, '冲突'),
+                      h('button', { type: 'button', className: 'mini', onClick: openFullDiff }, '在新标签页查看完整对比'),
+                    ),
+                    h('p', { className: 'hint' }, '同一条 id 在本机与备份里内容不同。默认保留本机；勾选后覆盖。'),
+                    h(
+                      'label',
+                      { className: 'mini' },
+                      h('input', { type: 'checkbox', checked: allChosen, onChange: toggleAll }),
+                      ' 全选',
+                    ),
+                    conflicts.slice(0, 200).map((conflict) =>
+                      h(
+                        'label',
+                        { key: `${conflict.sessionId}:${conflict.local.id}`, className: 'conflict' },
+                        h('input', {
+                          type: 'checkbox',
+                          checked: overwrite.has(`${conflict.sessionId}\u0000${conflict.local.id}`),
+                          onChange: () => toggleConflict(conflict),
+                        }),
+                        h('span', { className: 'diff' }, conflict.diff.map((row) => row.field).join(' · ')),
+                        h(
+                          'span',
+                          { className: 'snippet' },
+                          `本机：${shortText(conflict.local.text)} ⟷ 备份：${shortText(conflict.incoming.text)}`,
+                        ),
+                      ),
+                    ),
+                    conflicts.length > 200
+                      ? h('p', { className: 'hint' }, `其余 ${conflicts.length - 200} 条按「保留本机」处理。`)
+                      : null,
+                  )
+                : null,
+              h(
+                'label',
+                { className: 'mini' },
+                h('input', { type: 'checkbox', checked: importPrefs, onChange: (event) => setImportPrefs(event.target.checked) }),
+                ' 同时导入偏好（浮条模式 / 快捷键 / 悬停浮条 / 面板高度）',
+              ),
+              h(
+                'div',
+                { className: 'row' },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'mini',
+                    onClick: () => {
+                      setPending(null);
+                      setReport(null);
+                    },
+                  },
+                  '取消',
+                ),
+                h(
+                  'button',
+                  { type: 'button', className: 'mini', onClick: runImport, disabled: busy },
+                  `导入（新增 ${pending.plan.add.length} 条）`,
+                ),
+              ),
+            )
+          : null,
         h(SettingHead, {
           title: '已用存储',
           hint: `片段存在这个站点的浏览器存储里，不上传、不同步；清除「Cookie 及其他网站数据」会一并清掉，换端口或域名访问也看不到同一份。百分比按字符数 ÷ 约 ${(STORAGE_CHARS_LIMIT / 10000).toFixed(0)} 万估算（不同浏览器的上限不同，所以标「约」）。${
@@ -7653,7 +8219,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             slots.inject('settings.plugins.tab', () =>
               slots.register(
                 { name: 'settings.plugins.tab', id: PKG, order: 40, label: '固定片段' },
-                () => h(StorageSettingsTab),
+                () => h(StorageSettingsTab, { context }),
               ),
             ),
           );
