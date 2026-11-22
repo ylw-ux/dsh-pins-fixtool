@@ -6,24 +6,22 @@
 
 A Web UI plugin for [DeepSeek Harness](https://github.com/deepseek-ai). What gets lost while reading a long reply is *where was I, and which sentences actually mattered* — select, pin, come back. That is the whole of it.
 
-## What's new: 1.1.1 (2026-11-16)
+## What's new: 1.2.0 (2026-11-22)
 
-> **1.1.1 only fixes the version number in the README shipped inside the npm package; the code is identical to 1.1.0.** The notes below describe 1.1.0.
-
-**This release connects the transcript and the cards in both directions.** Until now a card could jump back to its passage; now the passage itself can act on its card.
+**This release makes your data portable.** Settings gains "Backup & restore": export a JSON backup, import it after moving machines or clearing site data.
 
 | Change | What it does |
 |---|---|
-| **Hover bar** | Rest the pointer on pinned text for ~0.12s and 「取消固定 / 引用 / 标签 / 复制」 appears next to the cursor. The passage brightens and gets a 2px edge mark at each end |
-| **Click to locate** | A click (no drag) on a mark scrolls the side panel to its card and pulses it. Hit testing is per character, so blank table cells never trigger it |
-| **No more duplicates** | A selection overlapping a filed passage is refused, and the existing passage is revealed; touching ends are not an overlap |
-| **Shading = the saved passage** | The old "grow short quotes to word boundaries" step is gone, so the edges are exact |
-| **Tighter settings page** | Each section's explanation moved behind a ⓘ (hover or click); `Alt+P` and the hover bar can each be switched off |
-| **Smoother** | Marker repaints only re-locate the row that changed and skip repainting when nothing moved; selecting no longer parses the selection on every event |
+| **Export** | Settings › Backup & restore: everything or the current conversation; if the download is refused, the text is copied to the clipboard and the notice says which path was used |
+| **Import** | Pick a file → preview (new / duplicate / conflict / invalid) → confirm. **Merge only, never delete** |
+| **Conflicts** | Same id with different content keeps the local copy by default; tick rows to overwrite, or open the full diff in a new tab |
+| **Report** | A one-line summary plus a JSON report file after the import |
+| **Sessions not on this machine** | An imported passage whose conversation is gone is marked "原会话不在本机": readable, copyable, not jumpable (derived at render time, never stored) |
+| **One check command** | `npm run check` runs the guards and 12 probes |
 
-**Compatibility**: the data format is unchanged — one new preference key `dsh-pins/hover`. Upgrading touches neither passages nor tags. Overlaps that already existed are **never rewritten**; settings reports how many there are.
+**Compatibility**: the data format is unchanged; backup files additionally carry derivable fields (`text` / `quote` / `rawQuote`) so they restore across versions. An import never overwrites or deletes local passages unless you tick a conflict row.
 
-> Prefer nothing appearing under the pointer? **Settings → Plugins → Pinned passages › Hover bar** turns it all off; click-to-locate keeps working.
+> The earlier 1.1.1 only fixed the version number in the README shipped inside the npm package; its code is 1.1.0.
 ## Install
 
 Requires the Harness Web UI (`dsh web`). One command — it also **selects the bundle into your profile** for you:
@@ -156,6 +154,8 @@ Either way the passage really reaches the model, and never expires afterwards.
 
 **Hover bar**: pointing at a filed passage shows 取消固定 / 引用 / 标签 / 复制 next to the cursor. Turning it off also removes the hover highlight and the two edge marks; clicking a mark to reveal its card keeps working.
 
+**Backup & restore**: export a JSON backup (everything / current conversation). An import is previewed before it is confirmed; conflicts can be overwritten row by row, and the full diff opens in a new tab. Import merges — it never deletes.
+
 **Storage used** (read-only):
 
 | Figure | What it is |
@@ -191,6 +191,7 @@ Recalculates after pinning, deleting or re-tagging.
 - **A selection longer than 2000 characters is kept as its first 2000** (the toolbar and the success notice say so at capture time, and the card marks it 「已截断」 with a tooltip). Quotes and chips share that ceiling. Passages saved before 1.0.4 hold only their first 600 characters, and that part cannot be recovered.
 - **When the same text appears several times in one message**, the jump picks the occurrence nearest the recorded offset that also passes a text check; if none does, it falls back to the whole message and marks the card 「原文未找到」.
 - **The 「全部」 view sorts and filters across every conversation**; with many entries, folding groups or filtering by tag beats scrolling to the bottom.
+- **An imported passage may not jump back to its source**: if it came from another machine, or that conversation was deleted, the card is marked 「原会话不在本机」 — the content is intact, copy and delete still work, only the jump is unavailable. Copying the matching .dsh/sessions back restores it.
 
 ## Compatibility
 
