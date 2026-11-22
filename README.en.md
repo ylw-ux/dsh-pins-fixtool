@@ -17,7 +17,7 @@ A Web UI plugin for [DeepSeek Harness](https://github.com/deepseek-ai). What get
 | **Conflicts** | Same id with different content keeps the local copy by default; tick rows to overwrite, or open the full diff in a new tab |
 | **Report** | A one-line summary plus a JSON report file after the import |
 | **Sessions not on this machine** | An imported passage whose conversation is gone is marked "原会话不在本机": readable, copyable, not jumpable (derived at render time, never stored) |
-| **One check command** | `npm run check` runs the guards and 12 probes |
+| **One check command** | `npm run check` runs the guards and 13 probes |
 
 **Compatibility**: the data format is unchanged; backup files additionally carry derivable fields (`text` / `quote` / `rawQuote`) so they restore across versions. An import never overwrites or deletes local passages unless you tick a conflict row.
 
@@ -138,7 +138,7 @@ Two shapes, and **both carry their content — neither is a pointer**:
 
 Either way the passage really reaches the model, and never expires afterwards.
 
-### 6. Settings: three switches and storage usage
+### 6. Settings: bars, shortcut, storage
 
 **Settings → Plugins → Pinned passages**.
 
@@ -154,7 +154,7 @@ Either way the passage really reaches the model, and never expires afterwards.
 
 **Hover bar**: pointing at a filed passage shows 取消固定 / 引用 / 标签 / 复制 next to the cursor. Turning it off also removes the hover highlight and the two edge marks; clicking a mark to reveal its card keeps working.
 
-**Backup & restore**: export a JSON backup (everything / current conversation) — "current conversation" is the one open in the main column, so the side panel does not need to be open. An import is previewed before it is confirmed; conflicts can be overwritten row by row, and the full diff opens in a new tab. Import merges — it never deletes.
+**Backup & restore**: the last section on the settings page; details are in section 8 below.
 
 **Storage used** (read-only):
 
@@ -177,6 +177,31 @@ Recalculates after pinning, deleting or re-tagging.
 
 ---
 
+### 8. Backup & restore
+
+A JSON backup is **for restoring on a machine**; the markdown outline in the panel header is **for reading**. Two channels, do not mix them up.
+
+| Action | Result |
+|---|---|
+| **Export · everything** | One `dsh-pins-backup-<date>.json` with every conversation's passages, standalone tags, sort order and preferences |
+| **Export · current conversation** | Only the conversation open in the main column — the side panel does not need to be open |
+| **Import** | Pick a file → preview (new / duplicate / conflict / invalid) → confirm. **Merge only, never delete** |
+
+**When to use it**: moving machines, before clearing site data, or keeping a copy somewhere else. The success notice says whether it exported everything or just this conversation.
+
+**What an import does**:
+
+| Situation | Handling |
+|---|---|
+| Already on this machine | Skipped as a duplicate; **a tag-only difference is unioned**, not treated as a conflict |
+| Same id, different content | Local is kept by default; tick rows to overwrite, or open the full diff in a new tab |
+| Not on this machine | Added |
+| Source conversation is gone | Imported, but the card is marked 「原会话不在本机」: readable and copyable, not jumpable |
+
+After the import you get a one-line summary and a JSON report file (outcome and reason for every record). "Also import preferences" is off by default — ticking it **overwrites** the current interface settings with the ones in the backup.
+
+Both export and import use the download-plus-clipboard channel: if the browser refuses the download, the text is copied to the clipboard and the notice says which path was used.
+
 ## What it does not do
 
 - **No Markdown parsing, no HTML snapshots.** What is stored is the text you selected, plus its turn and offset — readable and portable.
@@ -191,6 +216,7 @@ Recalculates after pinning, deleting or re-tagging.
 - **A selection longer than 2000 characters is kept as its first 2000** (the toolbar and the success notice say so at capture time, and the card marks it 「已截断」 with a tooltip). Quotes and chips share that ceiling. Passages saved before 1.0.4 hold only their first 600 characters, and that part cannot be recovered.
 - **When the same text appears several times in one message**, the jump picks the occurrence nearest the recorded offset that also passes a text check; if none does, it falls back to the whole message and marks the card 「原文未找到」.
 - **The 「全部」 view sorts and filters across every conversation**; with many entries, folding groups or filtering by tag beats scrolling to the bottom.
+- **The import report cannot tell "never imported" from "imported, then deleted"**: this plugin keeps no tombstones, so the report only says "not on this machine / source conversation is missing". That is a deliberate trade — a separate storage key for one edge case may never be used by a future version, and deletions would get harder to handle.
 - **An imported passage may not jump back to its source**: if it came from another machine, or that conversation was deleted, the card is marked 「原会话不在本机」 — the content is intact, copy and delete still work, only the jump is unavailable. Copying the matching .dsh/sessions back restores it.
 
 ## Compatibility
