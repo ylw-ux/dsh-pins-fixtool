@@ -4793,6 +4793,9 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * @param scopeId - restrict to one session; `null`/`undefined` exports everything.
      */
     function buildBackup(scopeId) {
+      // `undefined` means "everything"; `null` means "the caller could not resolve a Session",
+      // and exporting everything in that case would answer the wrong question silently.
+      if (scopeId === null) return null;
       const raw = readJson(STATE_KEY, null);
       const data = raw && typeof raw === 'object' ? raw : {};
       const source = backupObject(data.sessions) ? data.sessions : {};
@@ -5290,11 +5293,18 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     function exportBackupJson(scopeId) {
       try {
         const backup = buildBackup(scopeId);
+        if (!backup) {
+          return { ok: false, message: '右侧栏没有打开的对话：先打开它再导出本会话，或改用「导出全部」' };
+        }
         let pins = 0;
         for (const entry of Object.values(backup.data.sessions)) pins += entry.pins.length;
         if (pins === 0) return { ok: false, message: scopeId ? '这个对话里没有可导出的片段' : '没有可导出的片段' };
         const text = formatBackupFile(backup);
         const name = backupFileName(new Date());
+        // Say which scope produced the file: two exports a minute apart are otherwise
+        // indistinguishable, and "did I export everything or just this conversation?" is
+        // exactly the question a file name cannot answer.
+        const scopeLabel = scopeId === undefined ? '全部' : '本会话';
         try {
           const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
           const url = URL.createObjectURL(blob);
@@ -5305,12 +5315,12 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           anchor.click();
           anchor.remove();
           window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
-          return { ok: true, message: `已导出 ${pins} 条到 ${name}`, file: name, pins };
+          return { ok: true, message: `已导出${scopeLabel} ${pins} 条到 ${name}`, file: name, pins, scope: scopeLabel };
         } catch (error) {
           console.error('[dsh-pins] 备份下载失败，改复制到剪贴板', error);
           try {
             void navigator.clipboard?.writeText(text);
-            return { ok: true, message: `下载被拒绝，已把备份（${pins} 条）复制到剪贴板`, pins, via: 'clipboard' };
+            return { ok: true, message: `下载被拒绝，已把${scopeLabel}备份（${pins} 条）复制到剪贴板`, pins, via: 'clipboard', scope: scopeLabel };
           } catch {
             return { ok: false, message: '导出失败：浏览器既不允许下载也不允许写剪贴板' };
           }
@@ -7855,7 +7865,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
               type: 'button',
               className: 'mini',
               onClick: () => {
-                const outcome = exportBackupJson(null);
+                const outcome = exportBackupJson();
                 setReport({ ok: outcome.ok, message: outcome.message });
               },
             },
@@ -7866,9 +7876,14 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
             {
               type: 'button',
               className: 'mini',
-              disabled: !scopedSession,
               title: scopedSession ? '只导出右侧栏当前这个对话' : '右侧栏没有打开的对话',
+              // Not disabled: a greyed button explains nothing. Clicking it says why it cannot
+              // act, which is the same rule the rest of this plugin follows.
               onClick: () => {
+                if (!scopedSession) {
+                  setReport({ ok: false, message: '右侧栏没有打开的对话：先打开它再导出本会话，或改用「导出全部」' });
+                  return;
+                }
                 const outcome = exportBackupJson(scopedSession);
                 setReport({ ok: outcome.ok, message: outcome.message });
               },
@@ -7970,7 +7985,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                 'label',
                 { className: 'mini' },
                 h('input', { type: 'checkbox', checked: importPrefs, onChange: (event) => setImportPrefs(event.target.checked) }),
-                ' 同时导入偏好（浮条模式 / 快捷键 / 悬停浮条 / 面板高度）',
+                ' 同时导入偏好（会用备份里的设置覆盖当前界面设置，含浮条模式 / 快捷键 / 悬停浮条 / 面板高度）',
               ),
               h(
                 'div',

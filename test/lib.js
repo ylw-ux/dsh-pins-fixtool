@@ -55,6 +55,9 @@ function sandbox(functions, options = {}) {
   const source = options.source ?? readClient();
   const constants = options.constants ?? [];
   const parts = [];
+  // Definitions the probe supplies itself (stubs for storage, the store, module `let`s), placed
+  // before the extracted source so extracted declarations can read them.
+  if (options.preamble) parts.push(options.preamble);
   for (const name of constants) parts.push(constantSource(source, name));
   for (const name of functions) parts.push(functionSource(source, name));
   const names = [...constants, ...functions];
@@ -83,3 +86,4 @@ function createSuite(title) {
 }
 
 module.exports = { CLIENT, readClient, functionSource, constantSource, sandbox, createSuite };
+

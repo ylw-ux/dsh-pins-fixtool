@@ -19,6 +19,7 @@ const steps = [
   { title: '坏文件拒绝', args: ['test/bad-file.js'] },
   { title: '降级可读性', args: ['test/downgrade.js'] },
   { title: '冲突对比 markdown', args: ['test/conflict-markdown.js'] },
+  { title: '导出范围', args: ['test/backup-scope.js'] },
   { title: '会话是否在本机', args: ['test/session-presence.js'] },
   { title: '标签补全排序', args: ['test/suggest-tags.js'] },
   { title: '标签键盘语义', args: ['test/tagkeys.js'] },
@@ -46,5 +47,6 @@ for (const step of steps) {
 
 if (failed === 0) console.log('\n✓ 全部检查通过');
 process.exit(failed);
+
 
 
