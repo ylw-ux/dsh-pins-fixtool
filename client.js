@@ -7065,6 +7065,16 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
       // Sessions shown as their own groups, with the order the user chose inside each.
       // Built before the header because the header's bulk fold control reads them.
+      const sessionGroups = React.useMemo(() => {
+        if (mode !== 'all') return [];
+        const groups = overview.map(([id, entry, pins]) => [
+          id,
+          { title: sessionLabel({ ...entry, liveTitle: readSessionTitle(context, id) }), pins, byName: false, collapsed: collapsed.has(id) },
+        ]);
+        for (const [id, group] of nameHitGroups) groups.push([id, { ...group, collapsed: collapsed.has(id) }]);
+        return groups;
+      }, [mode, overview, nameHitGroups, collapsed, context]);
+
       /**
        * Presence per group, derived at render time (never stored). Only 「全部」 can contain a
        * Session that is not on this machine.
@@ -7075,15 +7085,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
         for (const [id] of sessionGroups) map.set(id, sessionPresence(context, id));
         return map;
       }, [mode, sessionGroups, tick]);
-      const sessionGroups = React.useMemo(() => {
-        if (mode !== 'all') return [];
-        const groups = overview.map(([id, entry, pins]) => [
-          id,
-          { title: sessionLabel({ ...entry, liveTitle: readSessionTitle(context, id) }), pins, byName: false, collapsed: collapsed.has(id) },
-        ]);
-        for (const [id, group] of nameHitGroups) groups.push([id, { ...group, collapsed: collapsed.has(id) }]);
-        return groups;
-      }, [mode, overview, nameHitGroups, collapsed, context]);
+
 
       const fold = (id) =>
         setCollapsed((current) => {

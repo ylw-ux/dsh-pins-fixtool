@@ -47,9 +47,17 @@ check('选区读取按帧合并', /if \(readFrame === 0\) readFrame = window\.re
 check('拖动期间跳过读取', /if \(dragging\) return;/.test(src) && /let dragging = false;/.test(src));
 check('松手时读一次', /const onPointerUp = \(\) => \{\s*\r?\n\s*if \(!dragging\) return;\s*\r?\n\s*dragging = false;/.test(src));
 check('窗口失焦重置拖动状态', /dragging = false;\s*\r?\n\s*if \(!stateRef\.current\) return;/.test(src));
+// 7) 声明顺序：presenceById 依赖 sessionGroups，必须声明在后面（否则 TDZ 崩溃）
+const orderIndex = (needle) => src.indexOf(needle);
+check(
+  'presenceById 在 sessionGroups 之后声明',
+  orderIndex('const sessionGroups = React.useMemo') >= 0 &&
+    orderIndex('const presenceById = React.useMemo') > orderIndex('const sessionGroups = React.useMemo'),
+);
 for (const [name, ok, detail] of results) console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok ? '' : '\n      ' + detail}`);
 const failed = results.filter(([, ok]) => !ok).length;
 console.log(failed === 0 ? '\n全部通过' : `\n${failed} 项失败`);
 process.exit(failed === 0 ? 0 : 1);
+
 
 
