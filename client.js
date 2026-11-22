@@ -7717,6 +7717,8 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           version: 1,
           importedAt: new Date().toISOString(),
           source: pending.fileName,
+          // The denominator: without it, "added 5" cannot be read against the file's size.
+          file: { sessions: pending.stats.sessions, pins: pending.stats.pins },
           stats: {
             added: result.added,
             overwritten: result.overwritten,
