@@ -2796,6 +2796,12 @@ html[data-dsh-pins-bar-mode="pins"] [data-text-interaction-surface]{visibility:h
   font-size:var(--dsw-font-xxxs-11-font-size,11px);line-height:1.7}
 /* Section titles carry their explanation behind an icon: hover for the tooltip, click to pin
    it open. Keeps the controls above the fold. */
+/* A group whose Session is not on this machine: readable, not clickable. Warning ink, not a
+   red badge — the passages are intact, only the jump is unavailable. */
+.dsh-pins-root .group-why.missing{color:var(--dsw-alias-state-warn-primary)}
+.dsh-pins-root .dsh-pins-card .note{margin-top:6px;padding:6px 8px;line-height:1.6;
+  border-left:2px solid var(--dsw-alias-state-warn-primary);
+  color:var(--dsw-alias-label-secondary);font-size:var(--dsw-font-xxxs-11-font-size,11px)}
 .dsh-pins-settings .preview{margin-top:2px;padding:8px;display:flex;flex-direction:column;gap:6px;
   border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm)}
 .dsh-pins-settings .conflicts{display:flex;flex-direction:column;gap:4px;max-height:260px;overflow-y:auto;
@@ -5242,6 +5248,40 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
     }
 
     /**
+     * Whether this Session still exists on this machine. Three states on purpose.
+     *
+     * `unknown` is the third one and it matters: before the directory has loaded, "missing" is
+     * not a fact. Marking a card that came from this very machine would be worse than marking
+     * it late, so an unloaded directory reports `unknown` and nothing is marked.
+     *
+     * **Render-time only.** This value is never written into a pin: the directory can arrive
+     * later (another machine's `.dsh/sessions` copied in), and a stored flag would stay wrong
+     * forever.
+     */
+    function sessionPresence(context, sessionId) {
+      if (!sessionId) return 'unknown';
+      let sessions = null;
+      try {
+        sessions = context?.get?.('sessions') ?? null;
+      } catch {
+        return 'unknown';
+      }
+      const snapshot = (() => {
+        try {
+          return sessions?.list?.getSnapshot?.() ?? null;
+        } catch {
+          return null;
+        }
+      })();
+      if (!snapshot) return 'unknown';
+      if (typeof snapshot.phase === 'string' && snapshot.phase !== 'ready') return 'unknown';
+      const byId = backupObject(snapshot.byId) ? snapshot.byId : null;
+      if (!byId) return 'unknown';
+      if (byId[String(sessionId)]) return 'present';
+      // An empty directory means "not loaded yet", not "no Sessions".
+      return Object.keys(byId).length === 0 ? 'unknown' : 'missing';
+    }
+    /**
      * Download a backup, or copy it when the browser refuses the download.
      *
      * The same dual channel the markdown outline uses. A refused download that reports success
@@ -5867,7 +5907,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
      * that strip. `padding` would not do this: padding belongs to the scroller, so the
      * wheel would keep scrolling the text.
      */
-    function PinCard({ sessionId, pin, current, taggable, onTagChange, onQuote, context, cardState, foreign }) {
+    function PinCard({ sessionId, pin, current, taggable, onTagChange, onQuote, context, cardState, foreign, missingSession }) {
       const [draft, setDraft] = React.useState('');
       const [active, setActive] = React.useState(-1);
       const [moved, setMoved] = React.useState(false);
@@ -6106,6 +6146,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                 '已截断',
               )
             : null,
+          missingSession
+            ? h(
+                'span',
+                { className: 'warn', title: '这条对话不在这台机器上：卡片仍可查看、复制、加标签，但跳不回原文' },
+                '原会话不在本机',
+              )
+            : null,
           markerReport.get(pin.id) === 'miss'
             ? h('span', { className: 'warn', title: '这条消息在屏幕上，但没能定位到选中的那段文字：点卡片会跳到整条消息' }, '原文未找到')
             : null,
@@ -6116,6 +6163,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
           h('div', { className: 'ops' }, ops),
         ),
         h('div', { className: `${bodyClass}${open ? ' is-open' : ''}` }, fullText),
+        open && missingSession
+          ? h(
+              'div',
+              { className: 'note' },
+              '这条固定片段来自另一台机器或已删除的对话：内容都在，但原文不在这台机器上，点卡片不会跳转。把对应的 .dsh/sessions 拷回来就会恢复可跳转。',
+            )
+          : null,
         Array.isArray(pin.tags) && pin.tags.length > 0
           ? h(
               'div',
@@ -7011,6 +7065,16 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
       // Sessions shown as their own groups, with the order the user chose inside each.
       // Built before the header because the header's bulk fold control reads them.
+      /**
+       * Presence per group, derived at render time (never stored). Only 「全部」 can contain a
+       * Session that is not on this machine.
+       */
+      const presenceById = React.useMemo(() => {
+        const map = new Map();
+        if (mode !== 'all') return map;
+        for (const [id] of sessionGroups) map.set(id, sessionPresence(context, id));
+        return map;
+      }, [mode, sessionGroups, tick]);
       const sessionGroups = React.useMemo(() => {
         if (mode !== 'all') return [];
         const groups = overview.map(([id, entry, pins]) => [
@@ -7331,6 +7395,13 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                         group.collapsed ? '▸' : '▾',
                       ),
                       h('span', { className: 'group-name' }, group.title),
+                      presenceById.get(id) === 'missing'
+                        ? h(
+                            'span',
+                            { className: 'group-why missing', title: '这条对话不在这台机器上：卡片仍可查看与复制，跳转不可用' },
+                            '原会话不在本机',
+                          )
+                        : null,
                       // A group kept because its name matched says so: the pins below it
                       // are not search hits, they are the conversation's whole wall.
                       group.byName ? h('span', { className: 'group-why' }, '会话名命中') : null,
@@ -7344,6 +7415,7 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
                             sessionId: id,
                             pin,
                             current: isCurrent && id === sessionId,
+                            missingSession: presenceById.get(id) === 'missing',
                             // A card in 「全部」 is a full citizen, addressed to its own
                             // conversation: it quotes, and it edits that conversation's tags.
                             // It used to get `taggable: false` plus a no-op tag writer, which
