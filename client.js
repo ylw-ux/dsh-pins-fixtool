@@ -4585,6 +4585,466 @@ mark[data-dsh-pins-mark]{background-color:color-mix(in srgb,var(--dsw-alias-bran
 
     //#endregion
 
+    //#region backup file (JSON export / import)
+
+    /**
+     * Client-side label written into backup files.
+     *
+     * `test/version-sync.js` asserts it equals `package.json`, because this constant cannot be
+     * read from the package at runtime (the browser half has no `require` for it).
+     */
+    const PLUGIN_VERSION = '1.2.0';
+    /** Schema identity: a file without it is not ours, whatever else it contains. */
+    const BACKUP_FORMAT = 'dsh-pins-backup';
+    /** Bumped only when the meaning of an existing field changes. */
+    const BACKUP_VERSION = 1;
+    /** Refused before parsing: 20 MB is already far outside this plugin's scale. */
+    const BACKUP_MAX_BYTES = 20 * 1024 * 1024;
+    const BACKUP_MAX_PINS = 20000;
+    const BACKUP_MAX_SESSIONS = 5000;
+    /** Per-passage ceiling. Slightly above the capture limit so legacy 2000-char records fit. */
+    const BACKUP_MAX_TEXT = 2048;
+    const BACKUP_MAX_TAGS_PER_PIN = 50;
+    const BACKUP_MAX_EXTRA_TAGS = 200;
+    const BACKUP_MAX_TITLE = 200;
+
+    /**
+     * Anchor fields a backup may carry.
+     *
+     * A whitelist, not a spread: a file is untrusted input, and `{ ...anchor }` would copy
+     * `__proto__` and any field a future version happens to invent.
+     */
+    const ANCHOR_FIELDS = [
+      'sessionId',
+      'flowKey',
+      'node',
+      'kind',
+      'turn',
+      'offset',
+      'rawOffset',
+      'rawLength',
+      'quote',
+      'rawQuote',
+      'msgOrder',
+      'msgKey',
+      'block',
+      'lang',
+      'partial',
+      'truncated',
+    ];
+    /** Fields compared when the same id arrives with a different body. Tags union separately. */
+    const CONTENT_FIELDS = ['rawQuote', 'quote', 'rawOffset', 'rawLength', 'turn', 'msgKey'];
+
+    const BACKUP_ANCHOR_NUMBERS = new Set(['turn', 'offset', 'rawOffset', 'rawLength', 'msgOrder']);
+    const BACKUP_ANCHOR_FLAGS = new Set(['partial', 'truncated']);
+
+    /**
+     * A plain object: not an array, not a class instance.
+     *
+     * `typeof [] === 'object'`, so without this check an array accepted as `msgOrder` would be
+     * read as `{0: first, 1: second}` and pretend to be real data.
+     */
+    function backupObject(value) {
+      return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function backupNumber(value, fallback) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : fallback;
+    }
+
+    /** A string field, capped. Numbers and objects read as "absent", never as text. */
+    function backupString(value, limit) {
+      if (typeof value !== 'string') return '';
+      return limit > 0 && value.length > limit ? value.slice(0, limit) : value;
+    }
+
+    /** Normalized, deduped, capped tag list. */
+    function backupTags(value) {
+      const out = [];
+      const seen = new Set();
+      for (const raw of Array.isArray(value) ? value : []) {
+        if (typeof raw !== 'string') continue;
+        const tag = normalizeTag(raw);
+        if (tag === '' || seen.has(tag)) continue;
+        seen.add(tag);
+        out.push(tag);
+        if (out.length >= BACKUP_MAX_TAGS_PER_PIN) break;
+      }
+      return out;
+    }
+
+    /**
+     * Copy the whitelisted anchor fields.
+     *
+     * @returns the anchor, or `null` when the passage could not be located from it
+     *   (no row key, or no quote to search for). A record like that is reported, not imported:
+     *   a pin whose passage can never be found is a worse outcome than a skipped line.
+     */
+    function backupAnchor(value) {
+      if (!backupObject(value)) return null;
+      const anchor = {};
+      for (const field of ANCHOR_FIELDS) {
+        const raw = value[field];
+        if (raw === undefined || raw === null) continue;
+        if (BACKUP_ANCHOR_NUMBERS.has(field)) {
+          const number = backupNumber(raw, null);
+          if (number !== null) anchor[field] = number;
+          continue;
+        }
+        if (BACKUP_ANCHOR_FLAGS.has(field)) {
+          if (raw === true) anchor[field] = true;
+          continue;
+        }
+        const text = backupString(raw, field === 'quote' || field === 'rawQuote' ? 0 : 400);
+        if (text !== '') anchor[field] = text;
+      }
+      if (typeof anchor.flowKey !== 'string' || anchor.flowKey === '') return null;
+      if (typeof anchor.quote !== 'string' || anchor.quote === '') return null;
+      return anchor;
+    }
+
+    /**
+     * One pin, copied field by field.
+     *
+     * @returns `{ ok: true, pin, truncated }` or `{ ok: false, reason }`.
+     */
+    function backupPin(value) {
+      if (!value || typeof value !== 'object') return { ok: false, reason: 'not-object' };
+      const id = backupString(value.id, 0);
+      if (id === '') return { ok: false, reason: 'no-id' };
+      const anchor = backupAnchor(value.anchor);
+      if (anchor === null) return { ok: false, reason: 'no-anchor' };
+      const rawText = backupString(value.text, 0);
+      const text = rawText === '' ? backupString(anchor.quote, 0) : rawText;
+      const cut = text.length > BACKUP_MAX_TEXT;
+      return {
+        ok: true,
+        truncated: cut,
+        pin: {
+          id,
+          text: cut ? text.slice(0, BACKUP_MAX_TEXT) : text,
+          tags: backupTags(value.tags),
+          pinnedAt: backupNumber(value.pinnedAt, 0),
+          anchor,
+        },
+      };
+    }
+
+    /** One session entry, copied the same way. */
+    function backupSession(value, truncated) {
+      const entry = backupObject(value) ? value : {};
+      const pins = [];
+      for (const record of Array.isArray(entry.pins) ? entry.pins : []) {
+        const one = backupPin(record);
+        if (!one.ok) {
+          truncated.invalid += 1;
+          continue;
+        }
+        if (one.truncated) truncated.text += 1;
+        pins.push(one.pin);
+      }
+      if (pins.length === 0) return null;
+      const session = {
+        pins,
+        firstAt: backupNumber(entry.firstAt, 0),
+        updatedAt: backupNumber(entry.updatedAt, 0),
+      };
+      const title = backupString(entry.title, BACKUP_MAX_TITLE);
+      if (title !== '') session.title = title;
+      return session;
+    }
+
+    /**
+     * Build a backup file from the live state.
+     *
+     * The file carries every field a restore needs, including ones that can be derived
+     * (`text`, `quote`, `rawQuote`): a backup travels between versions, and recomputing a field
+     * that its version no longer writes would silently lose the passage.
+     *
+     * @param scopeId - restrict to one session; `null`/`undefined` exports everything.
+     */
+    function buildBackup(scopeId) {
+      const raw = readJson(STATE_KEY, null);
+      const data = raw && typeof raw === 'object' ? raw : {};
+      const source = backupObject(data.sessions) ? data.sessions : {};
+      const truncated = { text: 0, invalid: 0 };
+      const sessions = {};
+      for (const [id, entry] of Object.entries(source)) {
+        if (scopeId !== undefined && scopeId !== null && String(id) !== String(scopeId)) continue;
+        if (Object.keys(sessions).length >= BACKUP_MAX_SESSIONS) break;
+        const session = backupSession(entry, truncated);
+        if (session) sessions[id] = session;
+      }
+      const order = Array.isArray(data.order) ? data.order.filter((id) => typeof id === 'string') : [];
+      const extraTags = store.extraTags().flatMap((tag) => {
+        const name = normalizeTag(tag);
+        return name === '' ? [] : [name];
+      });
+      return {
+        format: BACKUP_FORMAT,
+        version: BACKUP_VERSION,
+        host: `${PKG}@${PLUGIN_VERSION}`,
+        exportedAt: new Date().toISOString(),
+        data: {
+          sessions,
+          // `order` and `sort` are state, not preference: without them a restored 「全部」 view
+          // would re-sort itself and an exported outline would look different after a restore.
+          order: order.filter((id) => id in sessions),
+          sort: normalizeSort(data.sort),
+          extraTags: extraTags.slice(0, BACKUP_MAX_EXTRA_TAGS),
+          msgOrder: (() => {
+            const saved = readJson(STABLE_ORDER_KEY, null);
+            const plain = {};
+            if (saved && typeof saved === 'object') {
+              for (const [key, value] of Object.entries(saved)) {
+                const number = backupNumber(value, null);
+                if (number !== null) plain[key] = number;
+              }
+            }
+            return plain;
+          })(),
+        },
+        preferences: {
+          mode: store.getMode(),
+          barMode,
+          hover: pinHoverOn,
+          shortcut: shortcutOn,
+          tagmgrHeight: readPanelManagerHeight(),
+        },
+      };
+    }
+
+    /**
+     * Validate and normalize a backup file. Pure: text in, structure out, no storage.
+     *
+     * Refusal is all-or-nothing. A file that half-parses must not be half-imported, so every
+     * fatal condition returns `ok: false` with a reason the UI can show verbatim; per-record
+     * problems only count, they do not abort the file.
+     */
+    function parseBackup(text) {
+      if (typeof text !== 'string' || text.trim() === '') return { ok: false, reason: 'empty', message: '文件是空的' };
+      if (text.length > BACKUP_MAX_BYTES) {
+        return { ok: false, reason: 'too-big', message: `文件超过 ${Math.round(BACKUP_MAX_BYTES / 1024 / 1024)} MB，拒绝导入` };
+      }
+      let raw = null;
+      try {
+        raw = JSON.parse(text);
+      } catch {
+        return { ok: false, reason: 'json', message: '这不是有效的 JSON（文件可能被截断或不是备份）' };
+      }
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'shape', message: '文件内容不是一个对象' };
+      if (raw.format !== BACKUP_FORMAT) return { ok: false, reason: 'format', message: '这不是固定片段的备份文件（format 不符）' };
+      const version = backupNumber(raw.version, 0);
+      if (version < 1 || version > BACKUP_VERSION) {
+        return { ok: false, reason: 'version', message: `备份版本 ${String(raw.version)} 不受支持：本版本只能读到 ${BACKUP_VERSION}` };
+      }
+
+      const data = backupObject(raw.data) ? raw.data : {};
+      const truncated = { text: 0, invalid: 0 };
+      const sessions = {};
+      let pins = 0;
+      const source = backupObject(data.sessions) ? data.sessions : {};
+      for (const [sessionId, entry] of Object.entries(source)) {
+        if (pins >= BACKUP_MAX_PINS) break;
+        if (Object.keys(sessions).length >= BACKUP_MAX_SESSIONS) break;
+        const session = backupSession(entry, truncated);
+        if (!session) continue;
+        // Trim the session to what is left of the global ceiling rather than dropping it whole.
+        const room = BACKUP_MAX_PINS - pins;
+        if (session.pins.length > room) session.pins = session.pins.slice(0, room);
+        pins += session.pins.length;
+        sessions[String(sessionId)] = session;
+      }
+
+      const extraTags = [];
+      const seenTags = new Set();
+      for (const value of Array.isArray(data.extraTags) ? data.extraTags : []) {
+        const tag = typeof value === 'string' ? normalizeTag(value) : '';
+        if (tag === '' || seenTags.has(tag)) continue;
+        seenTags.add(tag);
+        extraTags.push(tag);
+        if (extraTags.length >= BACKUP_MAX_EXTRA_TAGS) break;
+      }
+
+      const msgOrder = {};
+      const sourceOrder = backupObject(data.msgOrder) ? data.msgOrder : {};
+      for (const [key, value] of Object.entries(sourceOrder)) {
+        const number = backupNumber(value, null);
+        if (number !== null) msgOrder[key] = number;
+      }
+
+      const preferences = backupObject(raw.preferences) ? raw.preferences : null;
+      return {
+        ok: true,
+        backup: {
+          format: BACKUP_FORMAT,
+          version,
+          host: backupString(raw.host, 120),
+          exportedAt: backupString(raw.exportedAt, 64),
+          data: {
+            sessions,
+            order: (Array.isArray(data.order) ? data.order : []).filter((id) => typeof id === 'string' && id in sessions),
+            sort: normalizeSort(data.sort),
+            extraTags,
+            msgOrder,
+          },
+          preferences: preferences
+            ? {
+                mode: preferences.mode === 'all' ? 'all' : 'session',
+                barMode: BAR_MODES.includes(preferences.barMode) ? preferences.barMode : null,
+                hover: typeof preferences.hover === 'boolean' ? preferences.hover : null,
+                shortcut: typeof preferences.shortcut === 'boolean' ? preferences.shortcut : null,
+                tagmgrHeight: backupNumber(preferences.tagmgrHeight, null),
+              }
+            : null,
+        },
+        stats: {
+          sessions: Object.keys(sessions).length,
+          pins,
+          truncatedText: truncated.text,
+          invalidRecords: truncated.invalid,
+        },
+      };
+    }
+
+    /** What counts as "the same body" when two records share an id. */
+    function contentSignatureOf(pin) {
+      const anchor = pin?.anchor ?? {};
+      return CONTENT_FIELDS.map((field) => {
+        const value = anchor[field];
+        return value === undefined || value === null ? '' : String(value);
+      }).join('\u0000');
+    }
+
+    /** Identity of the passage's position inside one Session. */
+    function slotKeyOf(sessionId, pin) {
+      const anchor = pin?.anchor ?? {};
+      const offset = backupNumber(anchor.rawOffset, -1);
+      const length = backupNumber(anchor.rawLength, -1);
+      if (typeof anchor.flowKey !== 'string' || anchor.flowKey === '') return '';
+      if (offset < 0 || length < 0) return '';
+      return `${sessionId}\u0000${anchor.flowKey}\u0000${offset}\u0000${length}`;
+    }
+
+    /** Fallback identity for files written before offsets were recorded: same row, same words. */
+    function textKeyOf(sessionId, pin) {
+      const anchor = pin?.anchor ?? {};
+      const text = typeof anchor.rawQuote === 'string' && anchor.rawQuote !== '' ? anchor.rawQuote : anchor.quote;
+      if (typeof anchor.flowKey !== 'string' || anchor.flowKey === '') return '';
+      if (typeof text !== 'string' || text === '') return '';
+      return `${sessionId}\u0000${anchor.flowKey}\u0000${text}`;
+    }
+
+    /** Field-by-field difference, for the conflict panel. */
+    function diffPins(local, incoming) {
+      const rows = [];
+      for (const field of CONTENT_FIELDS) {
+        const left = local?.anchor?.[field];
+        const right = incoming?.anchor?.[field];
+        if (String(left ?? '') !== String(right ?? '')) rows.push({ field, local: left ?? '', incoming: right ?? '' });
+      }
+      const leftTags = (local?.tags ?? []).join('\u0000');
+      const rightTags = (incoming?.tags ?? []).join('\u0000');
+      if (leftTags !== rightTags) rows.push({ field: 'tags', local: local?.tags ?? [], incoming: incoming?.tags ?? [] });
+      return rows;
+    }
+
+    /** Queue a tag union for one existing pin, unless the file adds nothing. */
+    function queueTagUnion(plan, sessionId, existing, incoming) {
+      const union = [];
+      const seen = new Set();
+      for (const tag of [...(existing.tags ?? []), ...(incoming.tags ?? [])]) {
+        const name = normalizeTag(tag);
+        if (name === '' || seen.has(name)) continue;
+        seen.add(name);
+        union.push(name);
+      }
+      if (union.length <= (existing.tags ?? []).length) return;
+      const key = `${sessionId}\u0000${existing.id}`;
+      if (plan.mergeTags.has(key)) {
+        plan.mergeTags.get(key).tags = union;
+        return;
+      }
+      plan.mergeTags.set(key, { sessionId, id: existing.id, tags: union });
+    }
+
+    /**
+     * Decide what an import would do, without touching storage.
+     *
+     * Duplicate detection runs in three passes — id, then position, then text — because a file
+     * can be older than the stored record (same passage, new id) or newer (same id, body
+     * changed). Tags only ever union: they are a set, not a body.
+     *
+     * @param local - `{ sessions }` as currently stored.
+     * @returns `{ add, mergeTags, conflicts, duplicates }`; `conflicts` carries both records so
+     *   the panel can show a diff before anything is written.
+     */
+    function planImport(backup, local) {
+      const plan = { add: [], mergeTags: new Map(), conflicts: [], duplicates: 0 };
+      const byId = new Map();
+      const bySlot = new Map();
+      const byText = new Map();
+      for (const [sessionId, entry] of Object.entries(local?.sessions ?? {})) {
+        for (const pin of Array.isArray(entry?.pins) ? entry.pins : []) {
+          if (typeof pin?.id !== 'string' || pin.id === '') continue;
+          byId.set(pin.id, { sessionId, pin });
+          const slot = slotKeyOf(sessionId, pin);
+          if (slot !== '' && !bySlot.has(slot)) bySlot.set(slot, { sessionId, pin });
+          const text = textKeyOf(sessionId, pin);
+          if (text !== '' && !byText.has(text)) byText.set(text, { sessionId, pin });
+        }
+      }
+      for (const [sessionId, entry] of Object.entries(backup?.data?.sessions ?? {})) {
+        for (const pin of Array.isArray(entry?.pins) ? entry.pins : []) {
+          const same = byId.get(pin.id);
+          if (same) {
+            if (contentSignatureOf(same.pin) === contentSignatureOf(pin)) {
+              plan.duplicates += 1;
+              queueTagUnion(plan, same.sessionId, same.pin, pin);
+            } else {
+              plan.conflicts.push({ sessionId: same.sessionId, local: same.pin, incoming: pin, diff: diffPins(same.pin, pin) });
+            }
+            continue;
+          }
+          const slot = slotKeyOf(sessionId, pin);
+          const position = slot === '' ? undefined : bySlot.get(slot);
+          if (position) {
+            plan.duplicates += 1;
+            queueTagUnion(plan, position.sessionId, position.pin, pin);
+            continue;
+          }
+          const text = textKeyOf(sessionId, pin);
+          const textual = text === '' ? undefined : byText.get(text);
+          if (textual) {
+            plan.duplicates += 1;
+            queueTagUnion(plan, textual.sessionId, textual.pin, pin);
+            continue;
+          }
+          plan.add.push({ sessionId, pin });
+        }
+      }
+      return {
+        add: plan.add,
+        mergeTags: [...plan.mergeTags.values()],
+        conflicts: plan.conflicts,
+        duplicates: plan.duplicates,
+      };
+    }
+
+    /** The exact bytes that go into the file: stable key order, two-space indent. */
+    function formatBackupFile(backup) {
+      return JSON.stringify(backup, null, 2);
+    }
+
+    /** `dsh-pins-backup-20261122-1435.json` */
+    function backupFileName(stamp) {
+      const pad = (value) => String(value).padStart(2, '0');
+      return `dsh-pins-backup-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}.json`;
+    }
+
+    //#endregion
+
     //#region quoting into the composer
 
     /**

@@ -53,5 +53,8 @@
     "highlight",
     "notes"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "scripts": {
+    "check": "node tools/check.js"
+  }
 }
